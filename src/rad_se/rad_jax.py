@@ -72,7 +72,8 @@ class Config:
     num_eval_episodes: int = 10
     # SAC
     discount: float = 0.99
-    init_temperature: float = 0.1
+    init_temperature: float = 0.5  # higher = more exploration; prevent alpha collapse
+    reward_scale: float = 0.1      # scale rewards before storing; Playground sums over action_repeat → large magnitude
     actor_lr: float = 1e-3
     actor_beta: float = 0.9
     critic_lr: float = 1e-3
@@ -667,6 +668,36 @@ def make_env(cfg: Config):
     from mujoco_playground._src import dm_control_suite
     from mujoco_playground import wrapper as mp_wrapper
 
+    # ---------------------------------------------------------------------------
+    # BUG-FIX: Playground's CartpoleSwingup vision mode has a broken done
+    # condition.  Balance.step (shared by swingup) checks:
+    #   done |= (jp.abs(pole_angle) > jp.pi / 2)
+    # But SwingUp initialises the pole at angle ≈ π (bottom), so done=True
+    # fires IMMEDIATELY on every step, giving 1-step episodes and zero learning.
+    # We monkey-patch Balance.step to skip the angle bound when the instance
+    # carries a `_fix_swingup_done` marker (set after dm_control_suite.load).
+    # ---------------------------------------------------------------------------
+    from mujoco_playground._src.dm_control_suite import cartpole as _cp_mod
+    if not hasattr(_cp_mod.Balance, "_rad_se_patched"):
+        _orig_balance_step = _cp_mod.Balance.step
+
+        def _fixed_balance_step(self_env, state, action):
+            nstate = _orig_balance_step(self_env, state, action)
+            if getattr(self_env, "_fix_swingup_done", False):
+                data = nstate.data
+                cart_pos = data.qpos[self_env._slider_qposadr]
+                done = (
+                    jnp.isnan(data.qpos).any()
+                    | jnp.isnan(data.qvel).any()
+                    | (jnp.abs(cart_pos) > 3.0)
+                ).astype(jnp.float32)
+                nstate.info["time_out"] = done
+                nstate = nstate.replace(done=done)
+            return nstate
+
+        _cp_mod.Balance.step = _fixed_balance_step
+        _cp_mod.Balance._rad_se_patched = True
+
     env_config = dm_control_suite.get_default_config(cfg.env)
     # Enable vision at pre-crop resolution; nworld matches the agent batch
     env_config.vision = True
@@ -674,10 +705,18 @@ def make_env(cfg: Config):
     env_config.vision_config.nworld = cfg.num_envs
 
     env = dm_control_suite.load(cfg.env, config=env_config)
+    # Mark swingup envs so the patched step skips the pole-angle termination.
+    _swingup_envs = {"CartpoleSwingup"}
+    if cfg.env in _swingup_envs and env_config.vision:
+        env._fix_swingup_done = True
     action_dim = env.action_size
     max_ep_steps = int(env_config.episode_length)
 
-    # Vmap + EpisodeWrapper (action_repeat inside lax.scan) + auto-reset
+    # Vmap + EpisodeWrapper (action_repeat inside lax.scan) + auto-reset.
+    # full_reset=False (default): on episode end, each env resets to the cached
+    # first state it saw at env.reset() time. Since initial reset uses
+    # jax.random.split(rng, num_envs), each env has a distinct starting state,
+    # giving num_envs-way diversity without extra compute per step.
     env = mp_wrapper.wrap_for_brax_training(
         env,
         episode_length=max_ep_steps,
@@ -904,22 +943,23 @@ def main() -> None:
         # Bootstrap on timeout: not_done=1 if truncation (true done only on physics term)
         physics_done = np.where(trunc > 0.5, 0.0, done).astype(np.float32)
 
-        replay.add_batch(obs_u8, action_np, reward, next_obs_u8, physics_done)
+        # Scale rewards before storing: Playground EpisodeWrapper sums over
+        # action_repeat steps → large magnitude; scale down for SAC stability.
+        replay.add_batch(obs_u8, action_np, reward * cfg.reward_scale, next_obs_u8, physics_done)
 
         # ------ per-env episode logging on terminations ------
         finished = (done > 0.5) | (trunc > 0.5)
         if finished.any():
             for i in np.flatnonzero(finished):
-                if it % log_every_iters == 0:
-                    logger.log("train/episode_reward", float(ep_reward[i]), global_step)
-                    logger.log("train/episode", ep_count, global_step)
-                    logger.log("train/episode_length", int(ep_step[i]), global_step)
+                logger.log("train/episode_reward", float(ep_reward[i]), global_step)
+                logger.log("train/episode", ep_count, global_step)
+                logger.log("train/episode_length", int(ep_step[i]), global_step)
                 ep_count += 1
             ep_reward[finished] = 0.0
             ep_step[finished] = 0
-            if it % log_every_iters == 0:
-                elapsed = time.time() - start_time
-                logger.log("train/fps", global_step / max(elapsed, 1.0), global_step)
+        if it % log_every_iters == 0:
+            elapsed = time.time() - start_time
+            logger.log("train/fps", global_step / max(elapsed, 1.0), global_step)
 
         state  = next_state
         obs_u8 = next_obs_u8

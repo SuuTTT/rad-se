@@ -60,7 +60,10 @@ class Config:
     image_size: int = 84          # crop target (matches RAD paper)
     frame_stack: int = 3          # kept for documentation; Playground manages it
     max_episode_steps: int = 1000 # override if needed; will be read from env
-    # training
+    # parallel envs (Warp batch rendering)
+    num_envs: int = 64            # parallel envs per training iteration (Warp nworld)
+    updates_per_step: int = 0     # gradient steps per training iteration; 0 → num_envs (1:1 ratio)
+    # training (timesteps counted in agent env-steps; iterations = total / num_envs)
     total_timesteps: int = 200_000
     replay_capacity: int = 100_000
     init_steps: int = 1_000
@@ -119,6 +122,9 @@ def parse_args() -> Config:
         cfg.replay_capacity = 500
         cfg.batch_size = 16
         cfg.log_interval = 100
+        cfg.num_envs = 4
+    if cfg.updates_per_step <= 0:
+        cfg.updates_per_step = cfg.num_envs
     return cfg
 
 
@@ -510,6 +516,29 @@ class ReplayBuffer:
         self.idx = (self.idx + 1) % self.capacity
         self.full = self.full or self.idx == 0
 
+    def add_batch(
+        self,
+        obs: np.ndarray,        # (N, H, W, C) uint8
+        action: np.ndarray,     # (N, action_dim) float32
+        reward: np.ndarray,     # (N,) float32
+        next_obs: np.ndarray,   # (N, H, W, C) uint8
+        done: np.ndarray,       # (N,) float32  (1.0 only on true terminations)
+    ) -> None:
+        """Insert N transitions in one shot with ring-buffer wraparound."""
+        n = obs.shape[0]
+        # Compute destination indices, wrapping modulo capacity.
+        idxs = (np.arange(n) + self.idx) % self.capacity
+        self.obses[idxs]    = obs
+        self.n_obses[idxs]  = next_obs
+        self.actions[idxs]  = action
+        self.rewards[idxs]  = reward.reshape(n, 1)
+        self.not_done[idxs] = (1.0 - done).reshape(n, 1)
+        new_idx = (self.idx + n) % self.capacity
+        # If we wrapped or exactly filled, mark full
+        if not self.full and (self.idx + n) >= self.capacity:
+            self.full = True
+        self.idx = new_idx
+
     def sample(self) -> tuple:
         """Sample a batch with random crop applied. Returns JAX arrays."""
         max_idx = self.capacity if self.full else self.idx
@@ -621,62 +650,75 @@ def _update_actor_alpha(
 # ---------------------------------------------------------------------------
 
 def make_env(cfg: Config):
-    """Instantiate a Playground env with vision enabled.
+    """Instantiate a Playground env with vision enabled and batched parallel envs.
+
+    Uses ``wrap_for_brax_training`` which adds VmapWrapper + EpisodeWrapper
+    (handles action_repeat via ``lax.scan``) + BraxAutoResetWrapper. The
+    underlying Warp megakernel renderer is configured with ``nworld=num_envs``
+    so all envs are batched in a single kernel launch.
 
     Returns:
-        env: MjxEnv instance with vision=True
+        env: wrapped batched env. ``env.reset(keys)`` expects keys of shape
+             ``(num_envs, 2)``; ``env.step(state, action)`` expects action of
+             shape ``(num_envs, action_dim)``.
         action_dim: int
-        max_ep_steps: int   (episode_length in env config)
+        max_ep_steps: int (episode_length in physics steps from env config)
     """
     from mujoco_playground._src import dm_control_suite
+    from mujoco_playground import wrapper as mp_wrapper
 
     env_config = dm_control_suite.get_default_config(cfg.env)
-    # Enable vision at pre-crop resolution
+    # Enable vision at pre-crop resolution; nworld matches the agent batch
     env_config.vision = True
-    env_config.vision_config.cam_res = [cfg.cam_res, cfg.cam_res]
-    env_config.vision_config.nworld = 1   # single-env (no vmap)
-    # Vision rendering requires Warp; use default impl (warp)
-    # env_config.impl = "warp"  # already the default
+    env_config.vision_config.cam_res = (cfg.cam_res, cfg.cam_res)
+    env_config.vision_config.nworld = cfg.num_envs
 
     env = dm_control_suite.load(cfg.env, config=env_config)
-
     action_dim = env.action_size
-    max_ep_steps = env_config.episode_length
+    max_ep_steps = int(env_config.episode_length)
+
+    # Vmap + EpisodeWrapper (action_repeat inside lax.scan) + auto-reset
+    env = mp_wrapper.wrap_for_brax_training(
+        env,
+        episode_length=max_ep_steps,
+        action_repeat=cfg.action_repeat,
+    )
 
     return env, action_dim, max_ep_steps
 
 
-def env_reset(env, rng: jax.Array):
-    """Reset env and return (state, obs_uint8)."""
-    state = env.reset(rng)
-    obs_np = np.array(state.obs["pixels/view_0"])  # (nworld, H, W, 3) with nworld=1
-    if obs_np.ndim == 4:
-        obs_np = obs_np[0]  # squeeze nworld dim → (H, W, 3)
+def env_reset(env, rng: jax.Array, num_envs: int):
+    """Reset batched env. Returns (state, obs_uint8_batch).
+
+    obs has shape (num_envs, H, W, 3) uint8.
+    """
+    keys = jax.random.split(rng, num_envs)
+    state = env.reset(keys)
+    obs_np = np.array(state.obs["pixels/view_0"])  # (N, H, W, 3) float
     obs_u8 = obs_to_uint8(obs_np)
     return state, obs_u8
 
 
-def env_step(env, state, action_np: np.ndarray, action_repeat: int, max_ep_steps: int):
-    """Step the env action_repeat times. Returns (next_state, next_obs_u8, reward, done).
+def env_step(env, state, action_batch: np.ndarray):
+    """Step batched env once (action_repeat handled internally by EpisodeWrapper).
 
-    done is 1.0 on true physics failure only; episode timeout is returned
-    separately so the caller can set not_done=1.0 for timeout.
+    Args:
+        action_batch: (num_envs, action_dim) numpy float32 actions.
+    Returns:
+        next_state, next_obs_u8 (N,H,W,3), reward (N,), done (N,), truncation (N,)
     """
-    # nworld=1 obs have a leading batch dim but action stays (action_dim,)
-    action_jax = jnp.array(action_np)  # (action_dim,)
-    total_reward = 0.0
-    for _ in range(action_repeat):
-        state = env.step(state, action_jax)
-        total_reward += float(np.asarray(state.reward).ravel()[0])
-        if float(np.asarray(state.done).ravel()[0]) > 0.5:
-            break
-
-    next_obs_np = np.array(state.obs["pixels/view_0"])
-    if next_obs_np.ndim == 4:
-        next_obs_np = next_obs_np[0]  # squeeze nworld dim → (H, W, 3)
+    action_jax = jnp.asarray(action_batch)
+    next_state = env.step(state, action_jax)
+    next_obs_np = np.array(next_state.obs["pixels/view_0"])  # (N, H, W, 3) float
     next_obs_u8 = obs_to_uint8(next_obs_np)
-    done = float(np.asarray(state.done).ravel()[0])
-    return state, next_obs_u8, total_reward, done
+    reward = np.asarray(next_state.reward, dtype=np.float32).reshape(-1)
+    done = np.asarray(next_state.done, dtype=np.float32).reshape(-1)
+    # EpisodeWrapper writes a 'truncation' flag (1 when timeout, 0 when physics done).
+    trunc = np.asarray(
+        next_state.info.get("truncation", np.zeros_like(done)),
+        dtype=np.float32,
+    ).reshape(-1)
+    return next_state, next_obs_u8, reward, done, trunc
 
 
 # ---------------------------------------------------------------------------
@@ -692,32 +734,36 @@ def evaluate(
     logger: Logger,
     rng: jax.Array,
 ) -> tuple[float, jax.Array]:
-    rewards = []
-    for ep in range(cfg.num_eval_episodes):
-        rng, reset_key = jax.random.split(rng)
-        state, obs_u8 = env_reset(env, reset_key)
-        episode_reward = 0.0
-        ep_step = 0
-        while True:
-            # Center crop for deterministic eval
-            obs_crop = center_crop_np(obs_u8, cfg.image_size)
-            obs_jax = jnp.array(uint8_to_float(obs_crop))[None]  # (1, H, W, C)
-            # Deterministic action (mean)
-            mu, _, _, _ = actor(obs_jax, rng, compute_pi=False)
-            action_np = np.array(mu[0])
+    """Run ``num_envs`` parallel deterministic rollouts of one full episode each.
 
-            state, obs_u8, reward, done = env_step(
-                env, state, action_np, cfg.action_repeat, cfg.max_episode_steps
-            )
-            episode_reward += reward
-            ep_step += 1
-            if done > 0.5 or ep_step * cfg.action_repeat >= cfg.max_episode_steps:
-                break
-        rewards.append(episode_reward)
+    For DMC tasks (which never early-terminate), running for
+    ``max_episode_steps // action_repeat`` env-step iterations is exactly one
+    full episode per env. We use the batched training env infrastructure with
+    a fresh reset state to avoid disturbing the training trajectories — the
+    caller is responsible for separately tracking/preserving the train state.
+    """
+    rng, reset_key = jax.random.split(rng)
+    state, obs_u8 = env_reset(env, reset_key, cfg.num_envs)
 
-    mean_r = float(np.mean(rewards))
-    max_r  = float(np.max(rewards))
-    std_r  = float(np.std(rewards))
+    ep_returns = np.zeros(cfg.num_envs, dtype=np.float32)
+    n_iter = max(1, cfg.max_episode_steps // cfg.action_repeat)
+
+    for _ in range(n_iter):
+        # Center crop and pack to (N, H, W, C) float in [0,1]
+        obs_crop = np.stack(
+            [center_crop_np(obs_u8[i], cfg.image_size) for i in range(cfg.num_envs)],
+            axis=0,
+        )
+        obs_jax = jnp.asarray(uint8_to_float(obs_crop))
+        rng, key = jax.random.split(rng)
+        mu, _, _, _ = actor(obs_jax, key, compute_pi=False)
+        action_np = np.asarray(mu, dtype=np.float32)
+        state, obs_u8, reward, done, trunc = env_step(env, state, action_np)
+        ep_returns += reward
+
+    mean_r = float(np.mean(ep_returns))
+    max_r  = float(np.max(ep_returns))
+    std_r  = float(np.std(ep_returns))
     logger.log("eval/mean_episode_reward", mean_r, step)
     logger.log("eval/max_episode_reward",  max_r,  step)
     logger.log("eval/std_episode_reward",  std_r,  step)
@@ -802,94 +848,112 @@ def main() -> None:
     replay = ReplayBuffer(obs_shape, action_dim, cfg.replay_capacity, cfg.image_size)
 
     # ------------------------------------------------------------------
-    # Training loop
+    # Training loop (batched parallel envs)
     # ------------------------------------------------------------------
+    N = cfg.num_envs
+    K = cfg.updates_per_step
     rng, reset_key = jax.random.split(rng)
-    state, obs_u8 = env_reset(env, reset_key)
+    state, obs_u8 = env_reset(env, reset_key, N)  # obs_u8: (N, H, W, 3)
 
-    ep_reward   = 0.0
-    ep_step     = 0
-    ep_count    = 0
-    start_time  = time.time()
+    ep_reward = np.zeros(N, dtype=np.float32)
+    ep_step   = np.zeros(N, dtype=np.int64)
+    ep_count  = 0
+    start_time = time.time()
 
-    print(f"[rad_jax] Starting training for {cfg.total_timesteps} steps", flush=True)
+    total_iters = max(1, cfg.total_timesteps // N)
+    init_iters  = max(1, cfg.init_steps // N)
+    eval_every_iters = max(1, cfg.eval_freq // N)
+    log_every_iters  = max(1, cfg.log_interval // N)
 
-    for global_step in range(cfg.total_timesteps):
+    print(f"[rad_jax] Batched training: num_envs={N}, updates_per_step={K}, "
+          f"total_iters={total_iters} (≈{total_iters*N} env-steps), "
+          f"init_iters={init_iters}", flush=True)
+
+    for it in range(total_iters):
+        global_step = it * N
 
         # ------ eval ------
-        if global_step % cfg.eval_freq == 0:
+        if it % eval_every_iters == 0:
             _, rng = evaluate(env, actor, cfg, run_dir, global_step, logger, rng)
+            # eval consumed env state; resume training from a fresh reset
+            rng, reset_key = jax.random.split(rng)
+            state, obs_u8 = env_reset(env, reset_key, N)
+            ep_reward.fill(0.0)
+            ep_step.fill(0)
 
-        # ------ action selection ------
-        if global_step < cfg.init_steps:
-            # Random action
-            action_np = np.random.uniform(-1.0, 1.0, size=(action_dim,)).astype(np.float32)
+        # ------ action selection (batched) ------
+        if it < init_iters:
+            action_np = np.random.uniform(
+                -1.0, 1.0, size=(N, action_dim)
+            ).astype(np.float32)
         else:
-            obs_crop = center_crop_np(obs_u8, cfg.image_size)
-            obs_jax  = jnp.array(uint8_to_float(obs_crop))[None]
+            obs_crop = np.stack(
+                [center_crop_np(obs_u8[i], cfg.image_size) for i in range(N)],
+                axis=0,
+            )
+            obs_jax = jnp.asarray(uint8_to_float(obs_crop))
             rng, key = jax.random.split(rng)
             _, pi, _, _ = actor(obs_jax, key)
-            action_np = np.array(pi[0])
+            action_np = np.asarray(pi, dtype=np.float32)
 
-        # ------ env step (with action repeat) ------
-        next_state, next_obs_u8, reward, physics_done = env_step(
-            env, state, action_np, cfg.action_repeat, max_ep_steps
-        )
+        # ------ env step (batched, action_repeat handled inside wrapper) ------
+        next_state, next_obs_u8, reward, done, trunc = env_step(env, state, action_np)
         ep_reward += reward
-        ep_step   += 1
+        ep_step   += cfg.action_repeat
 
-        # Timeout: do NOT mark done (bootstrapping)
-        timeout = ep_step * cfg.action_repeat >= max_ep_steps
-        done_bool = 0.0 if timeout else physics_done
+        # Bootstrap on timeout: not_done=1 if truncation (true done only on physics term)
+        physics_done = np.where(trunc > 0.5, 0.0, done).astype(np.float32)
 
-        replay.add(obs_u8, action_np, reward, next_obs_u8, done_bool)
+        replay.add_batch(obs_u8, action_np, reward, next_obs_u8, physics_done)
 
-        # Episode reset
-        if physics_done > 0.5 or timeout:
-            if global_step % cfg.log_interval == 0:
-                logger.log("train/episode_reward", ep_reward, global_step)
-                logger.log("train/episode", ep_count, global_step)
-                logger.log("train/episode_length", ep_step, global_step)
+        # ------ per-env episode logging on terminations ------
+        finished = (done > 0.5) | (trunc > 0.5)
+        if finished.any():
+            for i in np.flatnonzero(finished):
+                if it % log_every_iters == 0:
+                    logger.log("train/episode_reward", float(ep_reward[i]), global_step)
+                    logger.log("train/episode", ep_count, global_step)
+                    logger.log("train/episode_length", int(ep_step[i]), global_step)
+                ep_count += 1
+            ep_reward[finished] = 0.0
+            ep_step[finished] = 0
+            if it % log_every_iters == 0:
                 elapsed = time.time() - start_time
                 logger.log("train/fps", global_step / max(elapsed, 1.0), global_step)
-            rng, reset_key = jax.random.split(rng)
-            state, obs_u8 = env_reset(env, reset_key)
-            ep_reward = 0.0
-            ep_step   = 0
-            ep_count += 1
-        else:
-            state   = next_state
-            obs_u8  = next_obs_u8
+
+        state  = next_state
+        obs_u8 = next_obs_u8
 
         # ------ gradient updates ------
-        if global_step >= cfg.init_steps and len(replay) >= cfg.batch_size:
-            batch = replay.sample_bs(cfg.batch_size)
-            rng, update_key = jax.random.split(rng)
+        if it >= init_iters and len(replay) >= cfg.batch_size:
+            for upd in range(K):
+                batch = replay.sample_bs(cfg.batch_size)
+                rng, update_key = jax.random.split(rng)
 
-            # Critic update
-            critic_loss, rng = _update_critic(
-                actor, critic, critic_target, log_alpha,
-                critic_opt, batch, update_key, cfg.discount,
-            )
-            # Sync tied conv weights to actor
-            copy_conv_weights_to_actor(critic, actor)
-
-            if global_step % cfg.actor_update_freq == 0:
-                actor_loss, alpha_loss, rng = _update_actor_alpha(
-                    actor, critic, log_alpha,
-                    actor_opt, alpha_opt,
-                    batch, rng, target_entropy,
+                critic_loss, rng = _update_critic(
+                    actor, critic, critic_target, log_alpha,
+                    critic_opt, batch, update_key, cfg.discount,
                 )
-                if global_step % cfg.log_interval == 0:
-                    logger.log("train/actor_loss", actor_loss, global_step)
-                    logger.log("train/alpha_loss", alpha_loss, global_step)
-                    logger.log("train/alpha", float(log_alpha.alpha), global_step)
+                copy_conv_weights_to_actor(critic, actor)
 
-            if global_step % cfg.critic_target_update_freq == 0:
-                soft_update_target(critic, critic_target, cfg.critic_tau)
+                # Use a finer-grained "training step" for actor/target updates
+                train_step = global_step + upd
+                if train_step % cfg.actor_update_freq == 0:
+                    actor_loss, alpha_loss, rng = _update_actor_alpha(
+                        actor, critic, log_alpha,
+                        actor_opt, alpha_opt,
+                        batch, rng, target_entropy,
+                    )
+                    if it % log_every_iters == 0 and upd == 0:
+                        logger.log("train/actor_loss", actor_loss, global_step)
+                        logger.log("train/alpha_loss", alpha_loss, global_step)
+                        logger.log("train/alpha", float(log_alpha.alpha), global_step)
 
-            if global_step % cfg.log_interval == 0:
-                logger.log("train/critic_loss", critic_loss, global_step)
+                if train_step % cfg.critic_target_update_freq == 0:
+                    soft_update_target(critic, critic_target, cfg.critic_tau)
+
+                if it % log_every_iters == 0 and upd == 0:
+                    logger.log("train/critic_loss", critic_loss, global_step)
 
     # Final eval
     evaluate(env, actor, cfg, run_dir, cfg.total_timesteps, logger, rng)

@@ -828,6 +828,16 @@ def main() -> None:
         os.environ["JAX_DEFAULT_MATMUL_PRECISION"] = "highest"
         print("[rad_jax] Set JAX_DEFAULT_MATMUL_PRECISION=highest", flush=True)
 
+    # Prevent Warp mempool from growing unboundedly and OOM-ing the GPU.
+    # Setting release_threshold=0 causes CUDA to release unused pool blocks
+    # immediately instead of caching them, keeping Warp's VRAM footprint small.
+    try:
+        import warp as wp
+        wp.set_mempool_release_threshold("cuda:0", 0)
+        print("[rad_jax] Set Warp mempool release_threshold=0", flush=True)
+    except Exception as _e:
+        print(f"[rad_jax] Could not set Warp mempool threshold: {_e}", flush=True)
+
     set_global_seed(cfg.seed)
     rng = jax.random.PRNGKey(cfg.seed)
 

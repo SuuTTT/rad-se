@@ -3,6 +3,8 @@
 set -e
 export JAX_DEFAULT_MATMUL_PRECISION=highest
 export PYTHONPATH=src
+# Disable JAX's aggressive VRAM pre-allocation so Warp mempool has headroom
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
 
 ENVNAME=CartpoleSwingup
 N=64

@@ -635,8 +635,8 @@ def make_env(cfg: Config):
     env_config.vision = True
     env_config.vision_config.cam_res = [cfg.cam_res, cfg.cam_res]
     env_config.vision_config.nworld = 1   # single-env (no vmap)
-    # Use mjx backend (no Warp required) for physics
-    env_config.impl = "mjx"
+    # Vision rendering requires Warp; use default impl (warp)
+    # env_config.impl = "warp"  # already the default
 
     env = dm_control_suite.load(cfg.env, config=env_config)
 
@@ -649,7 +649,9 @@ def make_env(cfg: Config):
 def env_reset(env, rng: jax.Array):
     """Reset env and return (state, obs_uint8)."""
     state = env.reset(rng)
-    obs_np = np.array(state.obs["pixels/view_0"])  # (H, W, 3) float ~[-0.5, 0.5]
+    obs_np = np.array(state.obs["pixels/view_0"])  # (nworld, H, W, 3) with nworld=1
+    if obs_np.ndim == 4:
+        obs_np = obs_np[0]  # squeeze nworld dim → (H, W, 3)
     obs_u8 = obs_to_uint8(obs_np)
     return state, obs_u8
 
@@ -660,17 +662,20 @@ def env_step(env, state, action_np: np.ndarray, action_repeat: int, max_ep_steps
     done is 1.0 on true physics failure only; episode timeout is returned
     separately so the caller can set not_done=1.0 for timeout.
     """
-    action_jax = jnp.array(action_np)
+    # nworld=1 obs have a leading batch dim but action stays (action_dim,)
+    action_jax = jnp.array(action_np)  # (action_dim,)
     total_reward = 0.0
     for _ in range(action_repeat):
         state = env.step(state, action_jax)
-        total_reward += float(state.reward)
-        if float(state.done) > 0.5:
+        total_reward += float(np.asarray(state.reward).ravel()[0])
+        if float(np.asarray(state.done).ravel()[0]) > 0.5:
             break
 
     next_obs_np = np.array(state.obs["pixels/view_0"])
+    if next_obs_np.ndim == 4:
+        next_obs_np = next_obs_np[0]  # squeeze nworld dim → (H, W, 3)
     next_obs_u8 = obs_to_uint8(next_obs_np)
-    done = float(state.done)
+    done = float(np.asarray(state.done).ravel()[0])
     return state, next_obs_u8, total_reward, done
 
 
@@ -913,4 +918,8 @@ def _save_checkpoint(actor: Actor, critic: Critic, run_dir: Path, step: int) -> 
     checkpointer.save(str(ckpt_dir / "actor"),  actor_state)
     checkpointer.save(str(ckpt_dir / "critic"), critic_state)
     print(f"[rad_jax] Checkpoint saved at step {step}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
 

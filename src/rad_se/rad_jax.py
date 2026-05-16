@@ -620,6 +620,83 @@ def _update_critic(
 
 
 @nnx.jit
+def _update_critic_k_fused(
+    actor: Actor,
+    critic: Critic,
+    critic_target: Critic,
+    log_alpha: LogAlpha,
+    critic_opt: nnx.Optimizer,
+    obs_u8:   jax.Array,     # (K, bs, H, W, C) uint8
+    nobs_u8:  jax.Array,     # (K, bs, H, W, C) uint8
+    acts_all: jax.Array,     # (K, bs, action_dim)
+    rews_all: jax.Array,     # (K, bs, 1) or (K, bs)
+    notd_all: jax.Array,     # (K, bs, 1) or (K, bs)
+    keys_k:   jax.Array,     # (K, 2)
+    discount: float,
+    tau: jax.Array,          # scalar; jnp.float32
+    target_every: int,       # static int
+) -> jax.Array:
+    """Run K critic updates inside a single fori_loop (one JIT dispatch).
+
+    Also folds in the soft target update every `target_every` steps via nnx.cond.
+    Returns the loss of the *last* iteration (only for logging).
+    """
+
+    def body(i, carry):
+        actor_, critic_, critic_target_, log_alpha_, critic_opt_, last_loss = carry
+
+        # Cast uint8 slice to float32 inside the loop body — keeps PCIe + device
+        # memory 4× smaller while letting XLA fuse the cast with downstream ops.
+        obs      = obs_u8[i].astype(jnp.float32) / 255.0
+        next_obs = nobs_u8[i].astype(jnp.float32) / 255.0
+        actions  = acts_all[i]
+        rewards  = rews_all[i]
+        not_done = notd_all[i]
+        key      = keys_k[i]
+
+        # Critic update
+        _, next_pi, next_log_pi, _ = actor_(next_obs, key, detach_encoder=True)
+        q1_t, q2_t = critic_target_(next_obs, next_pi)
+        alpha_v = jax.lax.stop_gradient(log_alpha_.alpha)
+        next_log_pi = jax.lax.stop_gradient(next_log_pi)
+        target_q = jax.lax.stop_gradient(
+            rewards + not_done * discount * (jnp.minimum(q1_t, q2_t) - alpha_v * next_log_pi)
+        )
+
+        def loss_fn(c: Critic) -> jax.Array:
+            q1, q2 = c(obs, actions)
+            return jnp.mean((q1 - target_q) ** 2) + jnp.mean((q2 - target_q) ** 2)
+
+        loss_i, grads = nnx.value_and_grad(loss_fn)(critic_)
+        critic_opt_.update(critic_, grads)
+
+        # Soft target update every `target_every` steps
+        def do_tgt(args):
+            c_, ct_ = args
+            _, src = nnx.split(c_)
+            _, tgt = nnx.split(ct_)
+            new_tgt = jax.tree.map(lambda s, t: tau * s + (1.0 - tau) * t, src, tgt)
+            nnx.update(ct_, new_tgt)
+            return (c_, ct_)
+
+        def skip_tgt(args):
+            return args
+
+        critic_, critic_target_ = nnx.cond(
+            (i % target_every) == 0, do_tgt, skip_tgt, (critic_, critic_target_)
+        )
+
+        return (actor_, critic_, critic_target_, log_alpha_, critic_opt_, loss_i)
+
+    init_loss = jnp.zeros((), dtype=jnp.float32)
+    _, _, _, _, _, last_loss = nnx.fori_loop(
+        0, keys_k.shape[0], body,
+        (actor, critic, critic_target, log_alpha, critic_opt, init_loss),
+    )
+    return last_loss
+
+
+@nnx.jit
 def _update_actor_alpha(
     actor: Actor,
     critic: Critic,
@@ -1008,43 +1085,55 @@ def main() -> None:
             _update_keys = jax.random.split(_loop_key, K)
 
             # ONE H2D transfer for all K batches (uint8, 4× less PCIe than float32).
-            # Slicing obs_k[s:e] on the GPU and casting uint8→float32 is fused by XLA.
             obs_k, nobs_k, acts_k, rews_k, notd_k = replay.sample_k(K, cfg.batch_size)
             bs = cfg.batch_size
 
+            # Reshape (K*bs, ...) → (K, bs, ...) on-device (zero-copy view).
+            def _kbs(x):
+                return x.reshape((K, bs) + x.shape[1:])
+            obs_kbs   = _kbs(obs_k)
+            nobs_kbs  = _kbs(nobs_k)
+            acts_kbs  = _kbs(acts_k)
+            rews_kbs  = _kbs(rews_k)
+            notd_kbs  = _kbs(notd_k)
+
+            # === Fused critic+target loop: ONE JIT dispatch for all K updates ===
+            critic_loss = _update_critic_k_fused(
+                actor, critic, critic_target, log_alpha, critic_opt,
+                obs_kbs, nobs_kbs, acts_kbs, rews_kbs, notd_kbs,
+                _update_keys, cfg.discount,
+                jnp.float32(cfg.critic_tau),
+                int(cfg.critic_target_update_freq),
+            )
+
+            # === Actor + alpha updates: separate Python loop ===
+            # Only fires every `actor_update_freq` steps (K/2 dispatches when freq=2).
+            # Actor sees the critic *after* all K critic updates — slight semantic
+            # decoupling vs strict interleaving, but standard for replay-ratio>>1.
+            actor_loss = jnp.float32(0.0)
+            alpha_loss = jnp.float32(0.0)
             for upd in range(K):
-                s, e = upd * bs, (upd + 1) * bs
-                batch = (
-                    obs_k[s:e].astype(jnp.float32) / 255.0,
-                    acts_k[s:e],
-                    rews_k[s:e],
-                    nobs_k[s:e].astype(jnp.float32) / 255.0,
-                    notd_k[s:e],
-                )
-
-                critic_loss = _update_critic(
-                    actor, critic, critic_target, log_alpha,
-                    critic_opt, batch, _update_keys[upd], cfg.discount,
-                )
-
-                # Use a finer-grained "training step" for actor/target updates
                 train_step = global_step + upd
-                if train_step % cfg.actor_update_freq == 0:
-                    actor_loss, alpha_loss, rng = _update_actor_alpha(
-                        actor, critic, log_alpha,
-                        actor_opt, alpha_opt,
-                        batch, rng, target_entropy,
-                    )
-                    if it % log_every_iters == 0 and upd == 0:
-                        logger.log("train/actor_loss", actor_loss, global_step)
-                        logger.log("train/alpha_loss", alpha_loss, global_step)
-                        logger.log("train/alpha", float(log_alpha.alpha), global_step)
+                if train_step % cfg.actor_update_freq != 0:
+                    continue
+                batch_upd = (
+                    obs_kbs[upd].astype(jnp.float32) / 255.0,
+                    acts_kbs[upd],
+                    rews_kbs[upd],
+                    nobs_kbs[upd].astype(jnp.float32) / 255.0,
+                    notd_kbs[upd],
+                )
+                actor_loss, alpha_loss, rng = _update_actor_alpha(
+                    actor, critic, log_alpha,
+                    actor_opt, alpha_opt,
+                    batch_upd, rng, target_entropy,
+                )
 
-                if train_step % cfg.critic_target_update_freq == 0:
-                    soft_update_target(critic, critic_target, cfg.critic_tau)
-
-                if it % log_every_iters == 0 and upd == 0:
-                    logger.log("train/critic_loss", critic_loss, global_step)
+            if it % log_every_iters == 0:
+                logger.log("train/critic_loss", critic_loss, global_step)
+                logger.log("train/actor_loss", actor_loss, global_step)
+                logger.log("train/alpha_loss", alpha_loss, global_step)
+                logger.log("train/alpha", float(log_alpha.alpha), global_step)
 
             # Conv copy outside the K loop: 1 forced sync instead of K
             copy_conv_weights_to_actor(critic, actor)

@@ -577,13 +577,12 @@ def _update_critic(
     log_alpha: LogAlpha,
     critic_opt: nnx.Optimizer,
     batch: tuple,
-    rng: jax.Array,
+    key: jax.Array,
     discount: float,
-) -> tuple[jax.Array, jax.Array]:
+) -> jax.Array:
     obs, actions, rewards, next_obs, not_done = batch
 
     # Compute target Q without gradient through actor / target
-    rng, key = jax.random.split(rng)
     _, next_pi, next_log_pi, _ = actor(next_obs, key, detach_encoder=True)
     q1_t, q2_t = critic_target(next_obs, next_pi)
     alpha = jax.lax.stop_gradient(log_alpha.alpha)
@@ -598,7 +597,7 @@ def _update_critic(
 
     loss, grads = nnx.value_and_grad(loss_fn)(critic)
     critic_opt.update(critic, grads)
-    return loss, rng
+    return loss
 
 
 @nnx.jit
@@ -966,15 +965,17 @@ def main() -> None:
 
         # ------ gradient updates ------
         if it >= init_iters and len(replay) >= cfg.batch_size:
+            # Pre-generate all K keys: avoids K Python-level rng syncs in the loop
+            rng, _loop_key = jax.random.split(rng)
+            _update_keys = jax.random.split(_loop_key, K)
+
             for upd in range(K):
                 batch = replay.sample_bs(cfg.batch_size)
-                rng, update_key = jax.random.split(rng)
 
-                critic_loss, rng = _update_critic(
+                critic_loss = _update_critic(
                     actor, critic, critic_target, log_alpha,
-                    critic_opt, batch, update_key, cfg.discount,
+                    critic_opt, batch, _update_keys[upd], cfg.discount,
                 )
-                copy_conv_weights_to_actor(critic, actor)
 
                 # Use a finer-grained "training step" for actor/target updates
                 train_step = global_step + upd
@@ -994,6 +995,9 @@ def main() -> None:
 
                 if it % log_every_iters == 0 and upd == 0:
                     logger.log("train/critic_loss", critic_loss, global_step)
+
+            # Conv copy outside the K loop: 1 forced sync instead of K
+            copy_conv_weights_to_actor(critic, actor)
 
     # Final eval
     evaluate(env, actor, cfg, run_dir, cfg.total_timesteps, logger, rng)

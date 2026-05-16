@@ -551,6 +551,25 @@ class ReplayBuffer:
         idxs = np.random.randint(0, max_idx, size=batch_size)
         return self._build(idxs)
 
+    def sample_k(self, K: int, batch_size: int) -> tuple:
+        """Sample K*batch_size transitions in one shot.
+
+        Returns GPU arrays: obs/next_obs as uint8 (4× less PCIe than float32),
+        everything else as float32.  Shape: (K*batch_size, ...).
+        Caller casts obs to float32 on-GPU via .astype(jnp.float32)/255.0 inside JIT.
+        """
+        max_idx = self.capacity if self.full else self.idx
+        idxs = np.random.randint(0, max_idx, size=K * batch_size)
+        obs_raw  = random_crop_np(self.obses[idxs],   self.image_size)  # (K*bs,H,W,C) uint8
+        nobs_raw = random_crop_np(self.n_obses[idxs], self.image_size)  # (K*bs,H,W,C) uint8
+        # Single H2D transfer — obs as uint8 keeps bandwidth 4× lower
+        obs_g   = jnp.array(obs_raw)
+        nobs_g  = jnp.array(nobs_raw)
+        acts_g  = jnp.array(self.actions[idxs])
+        rews_g  = jnp.array(self.rewards[idxs])
+        notd_g  = jnp.array(self.not_done[idxs])
+        return obs_g, nobs_g, acts_g, rews_g, notd_g
+
     def _build(self, idxs: np.ndarray) -> tuple:
         obs_raw  = random_crop_np(self.obses[idxs], self.image_size)
         nobs_raw = random_crop_np(self.n_obses[idxs], self.image_size)
@@ -968,7 +987,16 @@ def main() -> None:
             ep_step[finished] = 0
         if it % log_every_iters == 0:
             elapsed = time.time() - start_time
-            logger.log("train/fps", global_step / max(elapsed, 1.0), global_step)
+            sps = global_step / max(elapsed, 1.0)
+            remaining_steps = cfg.total_timesteps - global_step
+            eta_sec = remaining_steps / max(sps, 0.1)
+            eta_str = f"{eta_sec/3600:.1f}h" if eta_sec >= 3600 else f"{eta_sec/60:.0f}m"
+            logger.log("train/fps", sps, global_step)
+            print(
+                f"| train | S:{global_step:8d}/{cfg.total_timesteps}"
+                f" | SPS:{sps:6.0f} | ETA:{eta_str} |",
+                flush=True,
+            )
 
         state  = next_state
         obs_u8 = next_obs_u8
@@ -979,8 +1007,20 @@ def main() -> None:
             rng, _loop_key = jax.random.split(rng)
             _update_keys = jax.random.split(_loop_key, K)
 
+            # ONE H2D transfer for all K batches (uint8, 4× less PCIe than float32).
+            # Slicing obs_k[s:e] on the GPU and casting uint8→float32 is fused by XLA.
+            obs_k, nobs_k, acts_k, rews_k, notd_k = replay.sample_k(K, cfg.batch_size)
+            bs = cfg.batch_size
+
             for upd in range(K):
-                batch = replay.sample_bs(cfg.batch_size)
+                s, e = upd * bs, (upd + 1) * bs
+                batch = (
+                    obs_k[s:e].astype(jnp.float32) / 255.0,
+                    acts_k[s:e],
+                    rews_k[s:e],
+                    nobs_k[s:e].astype(jnp.float32) / 255.0,
+                    notd_k[s:e],
+                )
 
                 critic_loss = _update_critic(
                     actor, critic, critic_target, log_alpha,

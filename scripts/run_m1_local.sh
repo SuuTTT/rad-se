@@ -5,6 +5,9 @@ export JAX_DEFAULT_MATMUL_PRECISION=highest
 export PYTHONPATH=src
 # Disable JAX's aggressive VRAM pre-allocation so Warp mempool has headroom
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+# Hard-cap JAX allocator at 50% of VRAM (6 GB on RTX 3060 12 GB).
+# Prevents XLA's BFC cache from crowding out Warp's physics/render pool.
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.50
 
 ENVNAME=CartpoleSwingup
 N=64

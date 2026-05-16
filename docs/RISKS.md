@@ -16,11 +16,19 @@
 ## Reproducibility
 
 - RAD's official numbers are hard to reproduce exactly; our prior one-file
-  port hit 861.58 vs paper ~840–870 on cartpole. Document the gap rather
-  than fudge it.
-- DMC pixel rendering is fragile across GPU generations. Lock onto RTX 3060
-  / 4060 tier and document the exact apt+pip stack from
-  `docs/LESSONS.md`.
+  PyTorch port hit 861.58 vs paper ~840–870 on cartpole. Document the gap
+  rather than fudge it.
+- **Playground != dm_control bit-exactly.** MJX uses MuJoCo physics but env
+  specs, dt, and action repeat conventions can differ. A 5–10% gap from the
+  PyTorch anchor on cartpole is acceptable; >15% needs investigation.
+- **TF32 trap on Ampere/Ada.** Always set
+  `JAX_DEFAULT_MATMUL_PRECISION=highest`; otherwise JAX uses TF32 and
+  silently reduces precision, which destabilizes SAC critic updates.
+- **SISA paper code is not public.** Reimplement strictly from the PDF; do
+  not paraphrase blog posts. Cite formulas with paper line/equation numbers
+  in code comments.
+- DMC pixel rendering is still fragile; the MJWarp renderer is newer code
+  than the PyTorch path, expect 1–2 days of integration friction.
 
 ## Cost
 
@@ -32,8 +40,10 @@
 ## Code
 
 - The reimplementrad SE-v1 path is **not** what SISA describes — do not
-  start from it. Start from `rad_sac_dmc_pixel.py` (baseline only) and
-  write SISA fresh.
-- Do not introduce JAX unless we are also willing to maintain the JAX
-  build on Vast.ai. PyTorch-first; JAX SE kernel can be ported by hand if
-  needed.
+  start from it. Start fresh in JAX.
+- We are choosing JAX. That commits us to maintaining a JAX + Playground +
+  Brax SAC + (later) Flax encoder stack. If the M0.5 smoke does not pass
+  cheaply, escalate before proceeding; do not fall back to PyTorch silently.
+- No SAC trainer ships with Playground. Use Brax SAC as the reference and
+  keep our SAC code as one file for diff-based review, following the
+  PyTorch `reimplementrad` precedent.

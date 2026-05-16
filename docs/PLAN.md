@@ -1,65 +1,87 @@
 # rad-se Plan
 
+## Stack decision
+
+- **Framework: JAX.** Flax for nets (default), Optax for opt, Brax SAC as the
+  RL anchor.
+- **Envs: MuJoCo Playground.** `mujoco_playground.dm_control_suite` for
+  cartpole / acrobot / cheetah, with pixel observations via the MJWarp Batch
+  Renderer. Visual gridworld for SISA Goal-2 will be built as a tiny custom
+  env on top of the same renderer when we get to M2.
+- **PyTorch path is frozen.** `reimplementrad` stays as the anchor for the
+  PyTorch baseline numbers; we do not touch it.
+
 ## Milestones
 
-### M0 — Reference materials (local)
-- Pull RAD paper PDF + SISA paper PDF into `references/`.
-- Pull MishaLaskin/rad at the commit verified to run on Vast.ai:
-  `18d079e677398c70ff2eefefcc81d5a99662103d`.
-- Copy `reimplementrad/implementations/rad_sac_dmc_pixel.py` as the
-  starting point for `src/rad_se/baseline_rad.py` (re-license-clean, drop the
-  v1 SE hash-graph reward — that is not SISA).
+### M0 — Reference materials
+- Pull RAD paper + SISA paper PDFs into `references/`.
+- Pull MishaLaskin/rad at commit `18d079e677398c70ff2eefefcc81d5a99662103d`
+  into `references/rad/` as read-only reference (do not import).
+- Pull the in-workspace one-file PyTorch port as a side-by-side reference (do
+  not import) so the JAX port stays diff-able.
 
-### M1 — RAD baseline reproduction
-- Tasks: `cartpole swingup` (action_repeat=8), `acrobot swingup`
-  (action_repeat=4), `cheetah run` (action_repeat=4).
-- Seeds: {23, 42, 7}. Train steps: 200_000. Eval every 10k, 10 episodes.
-- Hardware target: RTX 3060 / 4060 (cheap Vast.ai tiers). The acrobot run on
-  3060 took 4.9h wall, ~$0.27.
-- Acceptance: cartpole swingup eval@190k ≥ 800 (paper ≈ 840–870, our prior
-  one-file port hit **861.58**).
+### M0.5 — Playground smoke (cheap, must pass before anything else)
+- `pip install playground` (or install from source per the README).
+- Run the `Vision Environments` tutorial colab equivalent locally for one
+  cartpole-swingup episode at 84×84 pixel obs. Capture timing.
+- Export `JAX_DEFAULT_MATMUL_PRECISION=highest` on Ampere/Ada.
+- Stand up a Brax SAC reference and run it for 1k steps on cartpole-swingup
+  pixel obs to confirm SAC + pixel encoder wire correctly with the renderer.
+
+### M1 — RAD baseline reproduction on Playground
+- Tasks: `CartpoleSwingup`, `AcrobotSwingup`, `CheetahRun` from
+  `mujoco_playground.dm_control_suite`, pixel obs at 84×84, frame_stack=3.
+- Seeds: {23, 42, 7}. Train steps: 200_000 env-steps (action-repeat matched
+  to the PyTorch baseline: cartpole 8, acrobot 4, cheetah 4).
+- Hardware: 1 GPU (target 4090 / 5090 cloud tier; Playground is GPU-batched
+  so per-run cost should be lower than the 3060 PyTorch runs).
+- Acceptance for `cartpole swingup`: eval@190k ≥ 800 on ≥2 of 3 seeds. Anchor
+  numbers:
+  - paper RAD ~840–870.
+  - PyTorch one-file port (reimplementrad): **861.58**.
+  - Note: Playground != classic dm_control bit-exactly. A ~5–10% gap is
+    acceptable, document the gap, do not fudge.
 
 ### M2 — SISA faithful reimplementation
-- Shared pixel encoder (RAD encoder), SAC actor + twin critic.
-- **SI pretrain** stage: inverse-dynamics loss + contrastive smoothness +
-  state-transition smoothness. Run every encoder update for a warm-up window.
-- **SI finetune** stage: cluster-assignment KL between encoder embeddings and
-  a target partition (target updated on a slow schedule).
-- **SI abstract** stage: build batch-local partition-level transition / action
-  / reward graphs; compute SE / cut-objective over them; gradient flows
-  through the soft-assignment matrix `S`.
-- Schedule: pretrain dense → finetune mid-training → abstract late, matching
-  the SISA paper.
-- Use the JAX 2D SE kernel in `/workspace/glass-jax/src/glass/objectives/structural_entropy.py`
-  if we port the encoder to JAX; otherwise reimplement the same formula in
-  PyTorch. Either way the formula is fixed: `H^2(G)` from Li & Pan 2016.
+- Adaptive hierarchical state clustering → encoding tree T over minibatches.
+- Per-non-root-node aggregation function (formula pending PDF read).
+- Conditional structural entropy loss summed over non-root nodes, weighted by
+  node volume.
+- Encoder is shared between SAC heads and the SISA losses; gradients from
+  conditional SE flow into the encoder only (not into actor/critic heads).
+- Smoke first (5k steps, K_leaf=8, depth=2), then full (200k).
 
 ### M3 — Comparison grid
-- Methods: `rad`, `sisa_full`, `sisa_no_abstract`, `sisa_no_pretrain`.
-- Same 3 tasks × 3 seeds. Single Vast.ai launch batch per method/task. Total
-  compute target ≤ $20 (4 methods × 3 tasks × 3 seeds × ~5h × ~$0.06/h ≈
-  $10.8 plus overhead; gate at $25).
-- Report: mean ± 95% CI at {100k, 150k, 200k}, sample efficiency = first step
-  past 80% of asymptote, wall time, peak GPU mem.
+- Methods: `rad`, `sisa_full`, `sisa_flat_1d` (ablate tree),
+  `sisa_no_aggregation` (ablate aggregation function).
+- Same 3 Playground tasks × 3 seeds. One JAX process per task; methods can
+  share a vmap over seeds where possible (large GPU mem permitting).
+- Compute target ≤ $20 total. Hard ceiling $30.
+- Report: mean ± 95% CI at {100k, 150k, 200k}, sample efficiency = first
+  step past 80% of asymptote, wall time, peak GPU mem, paired-by-seed
+  Wilcoxon vs. RAD.
 
 ### M4 — Optimization probe (only if M3 passes)
-- Probe 1: replace SISA abstract SE with differentiable 2D SE from the
-  glass-jax kernel and check if gradients are cleaner.
-- Probe 2: JIT-compile graph construction; profile to confirm SI losses are
-  the bottleneck before optimizing them.
-- Ship only the probe that beats SISA at equal wall time on cartpole+acrobot.
-
+- Probe 1: drop in `glass-jax` differentiable 2D SE kernel for the
+  conditional SE loss; check gradient quality and wall time.
+- Probe 2: target-K aware partitioning at each tree depth.
+- Ship only the probe that strictly Pareto-beats SISA at equal wall time on
+  ≥2/3 tasks.
 ## Hardware / cost budget
 
 | Stage | $ budget | Wall | Notes |
 | --- | --- | --- | --- |
-| M1 RAD repro (9 runs) | $5 | ~45 GPU-h | RTX 3060 @ ~$0.055/h |
-| M2 SISA dev (smoke) | $2 | ~10 GPU-h | small batches, short steps |
-| M3 Comparison grid | $15 | ~135 GPU-h | hard ceiling $25 |
-| M4 Optimization | $5 | ~30 GPU-h | only if M3 green |
+| M0.5 Playground smoke | $1 | ~1 GPU-h | one cloud GPU hour |
+| M1 RAD repro on JAX (9 runs) | $5 | ~9 GPU-h | 4090/5090; JAX batched |
+| M2 SISA dev | $3 | ~6 GPU-h | smoke + iteration |
+| M3 Comparison grid (36 runs) | $15 | ~36 GPU-h | hard ceiling $30 |
+| M4 Optimization | $5 | ~10 GPU-h | only if M3 green |
 
 Stop at any milestone where SISA(full) does not reproducibly beat RAD on
 ≥2/3 tasks — escalate to user before continuing.
+
+The Vast.ai 3060 path documented in `LESSONS.md` is a **fallback** if cloud
+GPU access for JAX fails. We do not plan to rerun PyTorch RAD on Vast.ai.
 
 ## Success criteria
 

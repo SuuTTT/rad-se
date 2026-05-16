@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "rad-se"
+version = "0.1.0"
+description = "JAX RAD + SISA reproduction on MuJoCo Playground"
+requires-python = ">=3.10"
+dependencies = [
+    # JAX stack — install cuda variant separately:
+    #   pip install "jax[cuda12]"
+    "jax>=0.4.30",
+    "flax>=0.9.0",
+    "optax>=0.2.3",
+    "orbax-checkpoint>=0.6.0",
+    # MuJoCo Playground (pins mujoco[mjx])
+    "playground>=0.2.0",
+    # logging
+    "wandb>=0.17",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-xdist"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

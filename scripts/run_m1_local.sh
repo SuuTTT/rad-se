@@ -3,11 +3,12 @@
 set -e
 export JAX_DEFAULT_MATMUL_PRECISION=highest
 export PYTHONPATH=src
-# Disable JAX's aggressive VRAM pre-allocation so Warp mempool has headroom
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-# Hard-cap JAX allocator at 50% of VRAM (6 GB on RTX 3060 12 GB).
-# Prevents XLA's BFC cache from crowding out Warp's physics/render pool.
-export XLA_PYTHON_CLIENT_MEM_FRACTION=0.50
+# Use platform (cudaMalloc) allocator instead of JAX's BFC cache.
+# BFC keeps growing within its cap and eventually denies Warp's transient
+# 256-byte allocs (Warp + JAX share the same 12 GB VRAM pool on RTX 3060).
+# platform allocator does direct cudaMalloc/Free per JAX op — slightly slower
+# per-op but plays cleanly with Warp's pool.
+export XLA_PYTHON_CLIENT_ALLOCATOR=platform
 
 ENVNAME=CartpoleSwingup
 N=64
@@ -23,7 +24,9 @@ for SEED in 23 42 7; do
         --num-envs "$N" \
         --total-timesteps 200000 \
         --work-dir "$WORKDIR" \
-        2>&1 | tee "${WORKDIR}.log"
+        2>&1 \
+        | grep --line-buffered -v "Failed to track device allocation" \
+        | tee "${WORKDIR}.log"
     echo "  Seed ${SEED} finished."
 done
 

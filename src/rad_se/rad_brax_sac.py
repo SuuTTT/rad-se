@@ -56,6 +56,7 @@ if not hasattr(jax, "device_put_replicated"):
 from brax.training import distribution, gradients, networks as brax_networks, types
 from brax.training.agents.sac import losses as sac_losses, networks as sac_networks
 from brax.training import replay_buffers
+import warp as wp
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +70,7 @@ class Config:
     # env
     action_repeat: int = 8
     cam_res: int = 100
+    frame_stack: int = 1
     episode_length: int = 1000          # physics steps
     num_envs: int = 8                   # SAC: small env count, large replay
     num_eval_envs: int = 16
@@ -82,6 +84,9 @@ class Config:
     num_evals: int = 20
     discounting: float = 0.99
     learning_rate: float = 3e-4
+    alpha_learning_rate: float = 3e-4
+    init_temperature: float = 1.0
+    target_entropy: float = -0.5       # brax default for action_size=1; RAD uses -1.0
     reward_scaling: float = 0.1
     tau: float = 0.005                  # target network EMA coefficient
     # CNN backbone (RAD-style DQN encoder, same as PPO)
@@ -196,6 +201,40 @@ def _random_translate_pixels_sac(
     return rt_one(obs, keys)
 
 
+def _repeat_stack_pixels_sac(
+    obs: Mapping[str, jax.Array],
+    frame_stack: int,
+) -> Mapping[str, jax.Array]:
+    """Repeat reset pixel observations into an NHWC frame stack."""
+    if frame_stack <= 1:
+        return obs
+    out = dict(obs)
+    for k, v in obs.items():
+        if k.startswith("pixels/"):
+            out[k] = jnp.concatenate([v] * frame_stack, axis=-1)
+    return out
+
+
+def _append_stack_pixels_sac(
+    stacked_obs: Mapping[str, jax.Array],
+    next_obs: Mapping[str, jax.Array],
+    done: jax.Array,
+    frame_stack: int,
+) -> Mapping[str, jax.Array]:
+    """Append latest NHWC pixel frame; reset the stack on episode boundaries."""
+    if frame_stack <= 1:
+        return next_obs
+    out = dict(next_obs)
+    done_mask = done.reshape((done.shape[0],) + (1,) * (next(iter(next_obs.values())).ndim - 1))
+    reset_obs = _repeat_stack_pixels_sac(next_obs, frame_stack)
+    for k, v in next_obs.items():
+        if k.startswith("pixels/"):
+            channels = v.shape[-1]
+            shifted = jnp.concatenate([stacked_obs[k][..., channels:], v], axis=-1)
+            out[k] = jnp.where(done_mask, reset_obs[k], shifted)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Vision SAC networks: policy via brax, Q-network custom (CNN + action + MLP)
 # ---------------------------------------------------------------------------
@@ -306,6 +345,63 @@ def make_sac_networks_vision(
     )
 
 
+def make_sac_losses_vision(
+    sac_network: sac_networks.SACNetworks,
+    reward_scaling: float,
+    discounting: float,
+    target_entropy: float,
+):
+    """SAC losses matching brax, with configurable target entropy."""
+    policy_network = sac_network.policy_network
+    q_network = sac_network.q_network
+    parametric_action_distribution = sac_network.parametric_action_distribution
+
+    def alpha_loss(log_alpha, policy_params, normalizer_params, transitions, key):
+        dist_params = policy_network.apply(
+            normalizer_params, policy_params, transitions.observation)
+        action = parametric_action_distribution.sample_no_postprocessing(
+            dist_params, key)
+        log_prob = parametric_action_distribution.log_prob(dist_params, action)
+        alpha = jnp.exp(log_alpha)
+        return jnp.mean(alpha * jax.lax.stop_gradient(-log_prob - target_entropy))
+
+    def critic_loss(q_params, policy_params, normalizer_params, target_q_params,
+                    alpha, transitions, key):
+        q_old_action = q_network.apply(
+            normalizer_params, q_params, transitions.observation, transitions.action)
+        next_dist_params = policy_network.apply(
+            normalizer_params, policy_params, transitions.next_observation)
+        next_action = parametric_action_distribution.sample_no_postprocessing(
+            next_dist_params, key)
+        next_log_prob = parametric_action_distribution.log_prob(
+            next_dist_params, next_action)
+        next_action = parametric_action_distribution.postprocess(next_action)
+        next_q = q_network.apply(
+            normalizer_params, target_q_params,
+            transitions.next_observation, next_action)
+        next_v = jnp.min(next_q, axis=-1) - alpha * next_log_prob
+        target_q = jax.lax.stop_gradient(
+            transitions.reward * reward_scaling + transitions.discount * discounting * next_v)
+        q_error = q_old_action - jnp.expand_dims(target_q, -1)
+        truncation = transitions.extras["state_extras"]["truncation"]
+        q_error *= jnp.expand_dims(1 - truncation, -1)
+        return 0.5 * jnp.mean(jnp.square(q_error))
+
+    def actor_loss(policy_params, normalizer_params, q_params, alpha, transitions, key):
+        dist_params = policy_network.apply(
+            normalizer_params, policy_params, transitions.observation)
+        action = parametric_action_distribution.sample_no_postprocessing(
+            dist_params, key)
+        log_prob = parametric_action_distribution.log_prob(dist_params, action)
+        action = parametric_action_distribution.postprocess(action)
+        q_action = q_network.apply(
+            normalizer_params, q_params, transitions.observation, action)
+        min_q = jnp.min(q_action, axis=-1)
+        return jnp.mean(alpha * log_prob - min_q)
+
+    return alpha_loss, critic_loss, actor_loss
+
+
 # ---------------------------------------------------------------------------
 # Training state
 # ---------------------------------------------------------------------------
@@ -390,9 +486,64 @@ def main():
     train_env = make_envs(cfg, cfg.num_envs)
     eval_env = make_envs(cfg, cfg.num_eval_envs, is_eval=True)
 
+    # Warm up Warp CUDA kernels for both envs before any JAX JIT.
+    #
+    # Problem on CUDA driver < 12.3 (e.g. RTX 3090 with driver 12.2):
+    #   cuModuleLoad() is not permitted during an active CUDA stream capture.
+    #   mujoco_warp creates a nworld-specific module specialisation (f60f76d for
+    #   nworld=16) lazily on first call. If that first call happens inside JAX's
+    #   XLA graph compilation (which uses CUDA stream capture), cuModuleLoad
+    #   fails with CUDA error 900.
+    #   wp.force_load() can only load ALREADY-REGISTERED modules; f60f76d is not
+    #   registered until eval_env.reset() is first called, so pre-loading alone
+    #   is insufficient.
+    #
+    # Fix:
+    #   1. Set enable_graph_capture_module_load_by_default=False so that Warp's
+    #      own internal graph capture context does not start a stream capture.
+    #   2. Wrap warmup in jax.disable_jit() so XLA does not JIT-compile (and
+    #      therefore does not start a CUDA stream capture) during the first call.
+    #   3. With no active CUDA stream capture, cuModuleLoad succeeds on all
+    #      CUDA driver versions.
+    #   4. After warmup, f60f76d is registered; wp.force_load() loads it
+    #      (and all other modules) cleanly outside any capture.
+    #   On CUDA >= 12.3 the same path works and is equally fast.
+    _prev_wp_gcml = wp.config.enable_graph_capture_module_load_by_default
+    wp.config.enable_graph_capture_module_load_by_default = False
+
+    print("  Warming up Warp kernels (graph-capture-safe, jit disabled)…")
+    with jax.disable_jit():
+        _wk = jax.random.PRNGKey(0)
+        _wst = eval_env.reset(jax.random.split(_wk, cfg.num_eval_envs))
+        jax.block_until_ready(jax.tree_util.tree_leaves(_wst))
+        _wa = jnp.zeros((_wst.obs[next(iter(_wst.obs))].shape[0], train_env.action_size))
+        _wresult = eval_env.step(_wst, _wa)
+        jax.block_until_ready(jax.tree_util.tree_leaves(_wresult))
+        _wst2 = train_env.reset(jax.random.split(_wk, cfg.num_envs))
+        jax.block_until_ready(jax.tree_util.tree_leaves(_wst2))
+        _wa2 = jnp.zeros((_wst2.obs[next(iter(_wst2.obs))].shape[0], train_env.action_size))
+        _wresult2 = train_env.step(_wst2, _wa2)
+        jax.block_until_ready(jax.tree_util.tree_leaves(_wresult2))
+        del _wk, _wst, _wa, _wresult, _wst2, _wa2, _wresult2
+
+    wp.config.enable_graph_capture_module_load_by_default = _prev_wp_gcml
+    print("  Warp warmup complete.")
+
+    # Force-load ALL registered Warp modules now that f60f76d is registered.
+    # This runs outside any CUDA stream capture so cuModuleLoad always succeeds.
+    print("  Post-warmup Warp force_load (ensures all modules loaded)…")
+    wp.force_load(device="cuda:0")
+    print("  Warp force_load complete.")
+
     # Obs / action sizes
     full_obs_size = train_env.observation_size   # includes batch dim: {k: (N,H,W,C)}
-    obs_size = {k: v[1:] for k, v in full_obs_size.items()}  # {k: (H,W,C)}
+    raw_obs_size = {k: v[1:] for k, v in full_obs_size.items()}  # {k: (H,W,C)}
+    obs_size = {}
+    for k, v in raw_obs_size.items():
+        if k.startswith("pixels/") and cfg.frame_stack > 1:
+            obs_size[k] = v[:-1] + (v[-1] * cfg.frame_stack,)
+        else:
+            obs_size[k] = v
     action_size = train_env.action_size
 
     print(f"  obs_size (per env): {obs_size}")
@@ -402,16 +553,16 @@ def main():
     sac_net = make_sac_networks_vision(obs_size, action_size, cfg)
     make_policy = sac_networks.make_inference_fn(sac_net)
 
-    alpha_loss_fn, critic_loss_fn, actor_loss_fn = sac_losses.make_losses(
+    target_entropy = cfg.target_entropy
+    alpha_loss_fn, critic_loss_fn, actor_loss_fn = make_sac_losses_vision(
         sac_network=sac_net,
         reward_scaling=cfg.reward_scaling,
         discounting=cfg.discounting,
-        action_size=action_size,
+        target_entropy=target_entropy,
     )
-    alpha_lr = 3e-4
     policy_optimizer = optax.adam(cfg.learning_rate)
     q_optimizer = optax.adam(cfg.learning_rate)
-    alpha_optimizer = optax.adam(alpha_lr)
+    alpha_optimizer = optax.adam(cfg.alpha_learning_rate)
 
     alpha_update = gradients.gradient_update_fn(
         alpha_loss_fn, alpha_optimizer, pmap_axis_name=None)
@@ -447,8 +598,9 @@ def main():
         q_params=q_params,
         q_optimizer_state=q_optimizer.init(q_params),
         target_q_params=jax.tree_util.tree_map(jnp.array, q_params),
-        log_alpha=jnp.zeros(()),
-        alpha_optimizer_state=alpha_optimizer.init(jnp.zeros(())),
+        log_alpha=jnp.array(np.log(cfg.init_temperature), dtype=jnp.float32),
+        alpha_optimizer_state=alpha_optimizer.init(
+            jnp.array(np.log(cfg.init_temperature), dtype=jnp.float32)),
         normalizer_params=jnp.zeros(()),     # dummy: pixels not normalized
         env_steps=jnp.zeros((), dtype=jnp.int32),
     )
@@ -457,6 +609,7 @@ def main():
     rng, key_env, key_eval = jax.random.split(rng, 3)
     env_keys = jax.random.split(key_env, cfg.num_envs)
     env_state = jax.jit(train_env.reset)(env_keys)
+    obs_state = _repeat_stack_pixels_sac(env_state.obs, cfg.frame_stack)
     buffer_state = replay_buffer.init(key_buf)
 
     # ------------------------------------------------------------------ #
@@ -491,19 +644,21 @@ def main():
             alpha_optimizer_state=new_alpha_opt,
         ), {"alpha_loss": alpha_loss, "critic_loss": critic_loss, "actor_loss": actor_loss}
 
-    @functools.partial(jax.jit, donate_argnums=(0, 1, 2), static_argnums=(4,))
-    def training_epoch(ts, env_st, buf_st, key, steps):
+    @functools.partial(jax.jit, donate_argnums=(0, 1, 2, 3), static_argnums=(5,))
+    def training_epoch(ts, env_st, obs_st, buf_st, key, steps):
         """One epoch: `steps` env-steps + SAC updates."""
         def step_fn(carry, _):
-            ts, env_st, buf_st, key = carry
+            ts, env_st, obs_st, buf_st, key = carry
             key, act_key, aug_key, upd_key = jax.random.split(key, 4)
 
             # Collect: infer action from current obs
-            obs = env_st.obs
+            obs = obs_st
             dist_params = sac_net.policy_network.apply(
                 ts.normalizer_params, ts.policy_params, obs)
             action = sac_net.parametric_action_distribution.sample(dist_params, act_key)
             new_env_st = train_env.step(env_st, action)
+            next_obs_st = _append_stack_pixels_sac(
+                obs_st, new_env_st.obs, new_env_st.done, cfg.frame_stack)
 
             # Store transition (num_envs transitions per step)
             transition = types.Transition(
@@ -511,7 +666,7 @@ def main():
                 action=action,
                 reward=new_env_st.reward * cfg.reward_scaling,
                 discount=1.0 - new_env_st.done,
-                next_observation=new_env_st.obs,
+                next_observation=next_obs_st,
                 extras={"state_extras": {"truncation": new_env_st.info.get("truncation",
                                                            jnp.zeros(cfg.num_envs))}},
             )
@@ -529,30 +684,32 @@ def main():
                 )
             ts, metrics = sgd_step(ts, sampled, upd_key)
             ts = ts.replace(env_steps=ts.env_steps + cfg.num_envs)
-            return (ts, new_env_st, buf_st, key), metrics
+            return (ts, new_env_st, next_obs_st, buf_st, key), metrics
 
-        (ts, env_st, buf_st, key), metrics = jax.lax.scan(
-            step_fn, (ts, env_st, buf_st, key), None, length=steps)
-        return ts, env_st, buf_st, key, metrics
+        (ts, env_st, obs_st, buf_st, key), metrics = jax.lax.scan(
+            step_fn, (ts, env_st, obs_st, buf_st, key), None, length=steps)
+        return ts, env_st, obs_st, buf_st, key, metrics
 
     # Prefill: collect min_replay_size transitions without updates
     @jax.jit
-    def prefill_step(env_st, buf_st, key):
+    def prefill_step(env_st, obs_st, buf_st, key):
         key, act_key = jax.random.split(key)
         action = jax.random.uniform(
             act_key, (cfg.num_envs, action_size), minval=-1.0, maxval=1.0)
         new_env_st = train_env.step(env_st, action)
+        next_obs_st = _append_stack_pixels_sac(
+            obs_st, new_env_st.obs, new_env_st.done, cfg.frame_stack)
         transition = types.Transition(
-            observation=env_st.obs,
+            observation=obs_st,
             action=action,
             reward=new_env_st.reward * cfg.reward_scaling,
             discount=1.0 - new_env_st.done,
-            next_observation=new_env_st.obs,
+            next_observation=next_obs_st,
             extras={"state_extras": {"truncation": new_env_st.info.get(
                 "truncation", jnp.zeros(cfg.num_envs))}},
         )
         buf_st = replay_buffer.insert(buf_st, transition)
-        return new_env_st, buf_st, key
+        return new_env_st, next_obs_st, buf_st, key
 
     # ---------------------------------------------------------------- #
     # Warmup: fill replay buffer with random actions                    #
@@ -561,7 +718,8 @@ def main():
     warmup_steps = max(cfg.min_replay_size // cfg.num_envs, 1)
     for _ in range(warmup_steps):
         rng, step_key = jax.random.split(rng)
-        env_state, buffer_state, rng = prefill_step(env_state, buffer_state, rng)
+        env_state, obs_state, buffer_state, rng = prefill_step(
+            env_state, obs_state, buffer_state, rng)
 
     print(f"  Replay buffer ready. Starting training…")
 
@@ -577,6 +735,27 @@ def main():
     # env_steps increments by num_envs per scan step, so we divide by num_envs.
     scan_steps_per_eval = max(cfg.total_timesteps // cfg.num_evals // cfg.num_envs, 1)
 
+    # Stable JIT-compiled eval: defined once so JAX compiles it only on the first
+    # call (autotune runs once, Warp loads all block-dim variants) and then reuses
+    # the same XLA executable for every subsequent eval iteration.
+    @jax.jit
+    def run_eval(policy_params, normalizer_params, eval_key):
+        eval_st = eval_env.reset(jax.random.split(eval_key, cfg.num_eval_envs))
+        eval_obs_st = _repeat_stack_pixels_sac(eval_st.obs, cfg.frame_stack)
+        eval_policy_fn = make_policy((normalizer_params, policy_params), deterministic=True)
+
+        def _eval_step(carry, _):
+            st, obs_st, k = carry
+            k, sk = jax.random.split(k)
+            a, _ = eval_policy_fn(obs_st, sk)
+            st = eval_env.step(st, a)
+            obs_st = _append_stack_pixels_sac(obs_st, st.obs, st.done, cfg.frame_stack)
+            return (st, obs_st, k), st.reward
+
+        (_, _, _), rew = jax.lax.scan(
+            _eval_step, (eval_st, eval_obs_st, eval_key), None, length=agent_ep_len)
+        return jnp.sum(rew, axis=0).mean()
+
     t0 = time.time()
     last_log = t0
     eval_count = 0
@@ -587,28 +766,15 @@ def main():
         if steps_to_run <= 0:
             break
         rng, epoch_key = jax.random.split(rng)
-        training_state, env_state, buffer_state, rng, epoch_metrics = training_epoch(
-            training_state, env_state, buffer_state, epoch_key, steps_to_run)
+        training_state, env_state, obs_state, buffer_state, rng, epoch_metrics = training_epoch(
+            training_state, env_state, obs_state, buffer_state, epoch_key, steps_to_run)
 
         # Eval
         rng, eval_key = jax.random.split(rng)
-        # Reconstruct policy with current params for eval
-        eval_policy = make_policy(
-            (training_state.normalizer_params, training_state.policy_params),
-            deterministic=True)
-        eval_st = jax.jit(eval_env.reset)(jax.random.split(eval_key, cfg.num_eval_envs))
-
-        def _do_eval_step(carry, _):
-            st, k = carry
-            k, sk = jax.random.split(k)
-            a, _ = eval_policy(st.obs, sk)
-            st = eval_env.step(st, a)
-            return (st, k), st.reward
-
-        (_, _), rew = jax.lax.scan(
-            _do_eval_step, (eval_st, eval_key), None,
-            length=agent_ep_len)
-        er = float(jnp.sum(rew, axis=0).mean())
+        er = float(run_eval(
+            training_state.policy_params,
+            training_state.normalizer_params,
+            eval_key))
 
         elapsed = time.time() - t0
         env_steps = int(training_state.env_steps)

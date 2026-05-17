@@ -5,15 +5,14 @@ CleanRL-style one-file implementation targeting the same DMC pixel tasks as
 the original RAD paper (Laskin et al. NeurIPS 2020).
 
 Key design:
-  - MuJoCo Playground dm_control_suite envs with vision=True
-    (HWC grayscale frame-stack; Playground renders at cam_res then we random-crop)
+    - MuJoCo Playground dm_control_suite envs with vision=True
+        (RGB frame-stack in NHWC layout; Playground renders at cam_res then we random-crop)
   - Flax NNX modules, Optax optimizers
   - Numpy replay buffer (CPU); JIT-compiled SAC update step
   - Encoder conv weights shared via critic→actor copy after each critic update
     (faithful to the original PyTorch RAD implementation)
 
 Differences from the PyTorch port (reimplementrad/implementations/rad_sac_dmc_pixel.py):
-  - Input channels: 3 (grayscale frame-stack) instead of 9 (RGB×3)
   - Image range stored as uint8 [0,255], normalized to [0,1] for the encoder
   - Action repeat handled in the Python loop (same semantics, explicit)
   - NHWC conv layout (JAX default) instead of NCHW
@@ -58,7 +57,7 @@ class Config:
     action_repeat: int = 8       # 8 for cartpole, 4 for acrobot/cheetah
     cam_res: int = 100            # pre-crop resolution rendered by Playground
     image_size: int = 84          # crop target (matches RAD paper)
-    frame_stack: int = 3          # kept for documentation; Playground manages it
+    frame_stack: int = 3          # RGB frame-stack; stacked along NHWC channel axis
     max_episode_steps: int = 1000 # override if needed; will be read from env
     # parallel envs (Warp batch rendering)
     num_envs: int = 64            # parallel envs per training iteration (Warp nworld)
@@ -67,13 +66,13 @@ class Config:
     total_timesteps: int = 200_000
     replay_capacity: int = 100_000
     init_steps: int = 1_000
-    batch_size: int = 128
+    batch_size: int = 32
     eval_freq: int = 10_000
     num_eval_episodes: int = 10
     # SAC
     discount: float = 0.99
-    init_temperature: float = 0.5  # higher = more exploration; prevent alpha collapse
-    reward_scale: float = 0.1      # scale rewards before storing; Playground sums over action_repeat → large magnitude
+    init_temperature: float = 0.1  # original RAD init_temperature
+    reward_scale: float = 1.0      # exact RAD stores raw environment reward
     actor_lr: float = 1e-3
     actor_beta: float = 0.9
     critic_lr: float = 1e-3
@@ -179,6 +178,17 @@ def center_crop_np(image: np.ndarray, out: int) -> np.ndarray:
     h0 = (H - out) // 2
     w0 = (W - out) // 2
     return image[h0: h0 + out, w0: w0 + out, :]
+
+
+def init_frame_stack(obs_u8: np.ndarray, frame_stack: int) -> np.ndarray:
+    """Initialise a batched RGB frame stack by repeating reset frames."""
+    return np.concatenate([obs_u8] * frame_stack, axis=-1)
+
+
+def append_frame_stack(stacked_obs: np.ndarray, next_obs_u8: np.ndarray) -> np.ndarray:
+    """Append latest RGB frame and drop the oldest frame in an NHWC stack."""
+    channels = next_obs_u8.shape[-1]
+    return np.concatenate([stacked_obs[..., channels:], next_obs_u8], axis=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -878,6 +888,7 @@ def evaluate(
     """
     rng, reset_key = jax.random.split(rng)
     state, obs_u8 = env_reset(env, reset_key, cfg.num_envs)
+    obs_stack = init_frame_stack(obs_u8, cfg.frame_stack)
 
     ep_returns = np.zeros(cfg.num_envs, dtype=np.float32)
     n_iter = max(1, cfg.max_episode_steps // cfg.action_repeat)
@@ -885,7 +896,7 @@ def evaluate(
     for _ in range(n_iter):
         # Center crop and pack to (N, H, W, C) float in [0,1]
         obs_crop = np.stack(
-            [center_crop_np(obs_u8[i], cfg.image_size) for i in range(cfg.num_envs)],
+            [center_crop_np(obs_stack[i], cfg.image_size) for i in range(cfg.num_envs)],
             axis=0,
         )
         obs_jax = jnp.asarray(uint8_to_float(obs_crop))
@@ -893,6 +904,7 @@ def evaluate(
         mu, _, _, _ = actor(obs_jax, key, compute_pi=False)
         action_np = np.asarray(mu, dtype=np.float32)
         state, obs_u8, reward, done, trunc = env_step(env, state, action_np)
+        obs_stack = append_frame_stack(obs_stack, obs_u8)
         ep_returns += reward
 
     mean_r = float(np.mean(ep_returns))
@@ -952,9 +964,9 @@ def main() -> None:
     env, action_dim, max_ep_steps = make_env(cfg)
     cfg.max_episode_steps = max_ep_steps  # override with actual
 
-    # Observation shape stored in replay buffer (pre-crop, HWC uint8)
-    obs_shape = (cfg.cam_res, cfg.cam_res, 3)
-    in_channels = 3  # grayscale frame stack
+    # Observation shape stored in replay buffer (pre-crop, NHWC uint8 RGB stack)
+    obs_shape = (cfg.cam_res, cfg.cam_res, 3 * cfg.frame_stack)
+    in_channels = obs_shape[-1]
 
     print(f"[rad_jax] action_dim={action_dim}  max_ep_steps={max_ep_steps}  "
           f"obs_shape={obs_shape}", flush=True)
@@ -998,6 +1010,7 @@ def main() -> None:
     K = cfg.updates_per_step
     rng, reset_key = jax.random.split(rng)
     state, obs_u8 = env_reset(env, reset_key, N)  # obs_u8: (N, H, W, 3)
+    obs_stack = init_frame_stack(obs_u8, cfg.frame_stack)
 
     ep_reward = np.zeros(N, dtype=np.float32)
     ep_step   = np.zeros(N, dtype=np.int64)
@@ -1022,6 +1035,7 @@ def main() -> None:
             # eval consumed env state; resume training from a fresh reset
             rng, reset_key = jax.random.split(rng)
             state, obs_u8 = env_reset(env, reset_key, N)
+            obs_stack = init_frame_stack(obs_u8, cfg.frame_stack)
             ep_reward.fill(0.0)
             ep_step.fill(0)
 
@@ -1032,7 +1046,7 @@ def main() -> None:
             ).astype(np.float32)
         else:
             obs_crop = np.stack(
-                [center_crop_np(obs_u8[i], cfg.image_size) for i in range(N)],
+                [center_crop_np(obs_stack[i], cfg.image_size) for i in range(N)],
                 axis=0,
             )
             obs_jax = jnp.asarray(uint8_to_float(obs_crop))
@@ -1042,6 +1056,7 @@ def main() -> None:
 
         # ------ env step (batched, action_repeat handled inside wrapper) ------
         next_state, next_obs_u8, reward, done, trunc = env_step(env, state, action_np)
+        next_obs_stack = append_frame_stack(obs_stack, next_obs_u8)
         ep_reward += reward
         ep_step   += cfg.action_repeat
 
@@ -1050,7 +1065,7 @@ def main() -> None:
 
         # Scale rewards before storing: Playground EpisodeWrapper sums over
         # action_repeat steps → large magnitude; scale down for SAC stability.
-        replay.add_batch(obs_u8, action_np, reward * cfg.reward_scale, next_obs_u8, physics_done)
+        replay.add_batch(obs_stack, action_np, reward * cfg.reward_scale, next_obs_stack, physics_done)
 
         # ------ per-env episode logging on terminations ------
         finished = (done > 0.5) | (trunc > 0.5)
@@ -1077,6 +1092,7 @@ def main() -> None:
 
         state  = next_state
         obs_u8 = next_obs_u8
+        obs_stack = next_obs_stack
 
         # ------ gradient updates ------
         if it >= init_iters and len(replay) >= cfg.batch_size:

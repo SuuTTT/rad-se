@@ -55,5 +55,6 @@ python3.12 -u ~/rad-se/src/rad_se/rad_brax_sac.py \
     --tau 0.005 \
     --reward-scaling 0.1 \
     --augment-pixels \
+    --dmc-reward \
     --work-dir "$WORKDIR" \
     2>&1 | tee -a "$WORKDIR/train.log"

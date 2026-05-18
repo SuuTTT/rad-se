@@ -36,6 +36,7 @@ python3 -u src/rad_se/rad_brax_ppo.py \
     --clipping-epsilon 0.2 \
     --max-grad-norm 1.0 \
     --reward-scaling 0.1 \
+    --dmc-reward \
     --work-dir "$WORKDIR" \
     2>&1 \
     | grep -v "Failed to track device allocation" \

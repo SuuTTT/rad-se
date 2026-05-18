@@ -80,7 +80,8 @@ class Config:
     min_replay_size: int = 1_000        # warmup steps before updates start
     batch_size: int = 256               # SAC minibatch from replay
     grad_updates_per_step: int = 1
-    replay_pixel_dtype: str = "float32"  # float32, float16, or bfloat16
+    replay_backend: str = "device"       # device or host
+    replay_pixel_dtype: str = "float32"  # float32, float16, bfloat16, or uint8_centered (host only)
     # SAC hypers
     total_timesteps: int = 500_000
     num_evals: int = 20
@@ -91,6 +92,7 @@ class Config:
     target_entropy: float = -0.5       # brax default for action_size=1; RAD uses -1.0
     reward_scaling: float = 0.1
     tau: float = 0.005                  # target network EMA coefficient
+    encoder_tau: float = 0.0            # if >0, RAD encoder target EMA coefficient
     actor_update_frequency: int = 1
     alpha_update_frequency: int = 1
     target_update_frequency: int = 1
@@ -111,6 +113,12 @@ class Config:
     # Augmentation
     augment_pixels: bool = True         # RAD random-translate at sample time
     crop_size: int = 0                  # if >0, random crop train obs and center crop policy/eval obs
+    # Reward convention. mujoco_playground's vision-mode cartpole uses
+    # _dense_vision_reward (additive penalty, episode range ~[-3900, 100]).
+    # Setting dmc_reward=True monkey-patches the env to use _dense_reward,
+    # the dm_control tolerance-product reward (per-step [0,1], episode [0,1000]),
+    # matching the Playground/RAD paper numbers.
+    dmc_reward: bool = False
     # logging
     work_dir: str = "runs/brax_sac"
     track: bool = False
@@ -266,6 +274,8 @@ def _pixel_storage_dtype(name: str):
         return jnp.float16
     if name == "bfloat16":
         return jnp.bfloat16
+    if name == "uint8_centered":
+        return name
     raise ValueError(f"Unsupported replay_pixel_dtype={name!r}")
 
 
@@ -464,6 +474,22 @@ def _copy_rad_conv_weights_to_policy(policy_params: Any, q_params: Any) -> Any:
     return policy_params
 
 
+def _is_rad_encoder_path(path) -> bool:
+    for entry in path:
+        key = getattr(entry, "key", None)
+        if isinstance(key, str) and key.startswith("PixelEncoderRAD_"):
+            return True
+    return False
+
+
+def _soft_update_q_params(target_q_params: Any, q_params: Any, critic_tau: float, encoder_tau: float) -> Any:
+    def update_leaf(path, target, source):
+        tau = encoder_tau if _is_rad_encoder_path(path) else critic_tau
+        return target * (1 - tau) + source * tau
+
+    return jax.tree_util.tree_map_with_path(update_leaf, target_q_params, q_params)
+
+
 def make_sac_networks_vision(
     obs_size: Mapping[str, Tuple],   # per-env, e.g. {'pixels/view_0': (H,W,C)}
     action_size: int,
@@ -649,6 +675,152 @@ class UniformFlatReplayBuffer:
         return buffer_state.replace(key=key), batch
 
 
+class HostFlatReplayBuffer:
+    """Uniform replay with flat CPU storage and device batches on sample."""
+
+    def __init__(self, max_replay_size: int, dummy_data_sample: Any, sample_batch_size: int, storage_dtype, seed: int):
+        if storage_dtype == jnp.bfloat16:
+            raise ValueError("host replay currently supports float32 and float16 storage")
+        self._storage_dtype = storage_dtype
+        self._np_dtype = np.float16 if storage_dtype == jnp.float16 else np.float32
+        dummy_storage = _cast_transition(dummy_data_sample, storage_dtype)
+        dummy_flatten, self._unflatten_one = flatten_util.ravel_pytree(dummy_storage)
+        self._unflatten_fn = jax.vmap(self._unflatten_one)
+        self._flatten_fn = jax.jit(jax.vmap(
+            lambda x: flatten_util.ravel_pytree(_cast_transition(x, storage_dtype))[0]))
+        self._data = np.zeros((max_replay_size, len(dummy_flatten)), dtype=self._np_dtype)
+        self._max_replay_size = max_replay_size
+        self._sample_batch_size = sample_batch_size
+        self._insert_position = 0
+        self._size = 0
+        self._rng = np.random.default_rng(seed)
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def nbytes(self) -> int:
+        return self._data.nbytes
+
+    def insert(self, samples: Any) -> None:
+        update = np.asarray(self._flatten_fn(samples), dtype=self._np_dtype)
+        n = update.shape[0]
+        if n >= self._max_replay_size:
+            self._data[...] = update[-self._max_replay_size:]
+            self._insert_position = 0
+            self._size = self._max_replay_size
+            return
+        end = self._insert_position + n
+        if end <= self._max_replay_size:
+            self._data[self._insert_position:end] = update
+        else:
+            first = self._max_replay_size - self._insert_position
+            self._data[self._insert_position:] = update[:first]
+            self._data[:end - self._max_replay_size] = update[first:]
+        self._insert_position = end % self._max_replay_size
+        self._size = min(self._size + n, self._max_replay_size)
+
+    def sample_many(self, num_batches: int) -> Any:
+        if self._size <= 0:
+            raise ValueError("cannot sample from an empty replay buffer")
+        idx = self._rng.integers(
+            0, self._size, size=(num_batches, self._sample_batch_size), endpoint=False)
+        flat = self._data[idx.reshape(-1)]
+        batch = _cast_transition(self._unflatten_fn(jnp.asarray(flat)), jnp.float32)
+
+        def reshape_leaf(x):
+            return jnp.reshape(x, (num_batches, self._sample_batch_size) + x.shape[1:])
+
+        return jax.tree_util.tree_map(reshape_leaf, batch)
+
+
+def _is_pixel_replay_path(path: tuple[Any, ...]) -> bool:
+    for entry in path:
+        key = getattr(entry, "key", None)
+        if key is None:
+            key = getattr(entry, "name", None)
+        if isinstance(key, str) and key.startswith("pixels/"):
+            return True
+    return False
+
+
+class HostTypedReplayBuffer:
+    """CPU replay that can quantize only pixel leaves while preserving others."""
+
+    def __init__(self, max_replay_size: int, dummy_data_sample: Any, sample_batch_size: int, storage_dtype, seed: int):
+        if storage_dtype != "uint8_centered":
+            raise ValueError(f"Unsupported typed host replay dtype={storage_dtype!r}")
+        path_leaves, self._treedef = jax.tree_util.tree_flatten_with_path(dummy_data_sample)
+        self._is_pixel = [_is_pixel_replay_path(path) for path, _ in path_leaves]
+        self._data = []
+        for is_pixel, leaf in zip(self._is_pixel, [leaf for _, leaf in path_leaves]):
+            dtype = np.uint8 if is_pixel else np.float32
+            self._data.append(np.zeros((max_replay_size,) + leaf.shape, dtype=dtype))
+        self._max_replay_size = max_replay_size
+        self._sample_batch_size = sample_batch_size
+        self._insert_position = 0
+        self._size = 0
+        self._rng = np.random.default_rng(seed)
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    @property
+    def nbytes(self) -> int:
+        return sum(arr.nbytes for arr in self._data)
+
+    @staticmethod
+    def _encode_pixels(x: np.ndarray) -> np.ndarray:
+        return np.rint(np.clip((x + 0.5) * 255.0, 0.0, 255.0)).astype(np.uint8)
+
+    @staticmethod
+    def _decode_pixels(x: np.ndarray) -> np.ndarray:
+        return x.astype(np.float32) / 255.0 - 0.5
+
+    def insert(self, samples: Any) -> None:
+        leaves = jax.tree_util.tree_leaves(samples)
+        n = leaves[0].shape[0]
+        if n >= self._max_replay_size:
+            leaf_updates = []
+            for is_pixel, leaf in zip(self._is_pixel, leaves):
+                update = np.asarray(leaf)[-self._max_replay_size:]
+                leaf_updates.append(self._encode_pixels(update) if is_pixel else update.astype(np.float32))
+            for storage, update in zip(self._data, leaf_updates):
+                storage[...] = update
+            self._insert_position = 0
+            self._size = self._max_replay_size
+            return
+
+        end = self._insert_position + n
+        for storage, is_pixel, leaf in zip(self._data, self._is_pixel, leaves):
+            update = np.asarray(leaf)
+            update = self._encode_pixels(update) if is_pixel else update.astype(np.float32)
+            if end <= self._max_replay_size:
+                storage[self._insert_position:end] = update
+            else:
+                first = self._max_replay_size - self._insert_position
+                storage[self._insert_position:] = update[:first]
+                storage[:end - self._max_replay_size] = update[first:]
+        self._insert_position = end % self._max_replay_size
+        self._size = min(self._size + n, self._max_replay_size)
+
+    def sample_many(self, num_batches: int) -> Any:
+        if self._size <= 0:
+            raise ValueError("cannot sample from an empty replay buffer")
+        idx = self._rng.integers(
+            0, self._size, size=(num_batches, self._sample_batch_size), endpoint=False)
+        flat_idx = idx.reshape(-1)
+        leaves = []
+        for storage, is_pixel in zip(self._data, self._is_pixel):
+            sampled = storage[flat_idx]
+            sampled = self._decode_pixels(sampled) if is_pixel else sampled.astype(np.float32)
+            sampled = sampled.reshape((num_batches, self._sample_batch_size) + sampled.shape[1:])
+            leaves.append(jnp.asarray(sampled, dtype=jnp.float32))
+        return self._treedef.unflatten(leaves)
+
+
 # ---------------------------------------------------------------------------
 # Training state
 # ---------------------------------------------------------------------------
@@ -682,10 +854,23 @@ def make_envs(cfg: Config, num_envs: int, is_eval: bool = False):
     raw_env = dm_control_suite.load(cfg.env, config=env_config)
     if "Swingup" in cfg.env or "swingup" in cfg.env:
         raw_env._fix_swingup_done = True
-    agent_episode_length = cfg.episode_length // cfg.action_repeat
+    # Force dm_control-style tolerance reward in vision mode (per-step in [0,1],
+    # episode in [0, 1000]) instead of the additive-penalty vision reward.
+    # Wrap with a throwaway metrics dict so we don't introduce new keys into
+    # state.metrics (which would break the action-repeat scan pytree carry).
+    if cfg.dmc_reward and hasattr(raw_env, "_dense_reward"):
+        _dense = raw_env._dense_reward
+        def _dmc_reward_fn(data, action, info, metrics):
+            return _dense(data, action, info, {})
+        raw_env._get_reward = _dmc_reward_fn
+    # brax EpisodeWrapper measures episode_length in physics steps (it adds
+    # action_repeat to its internal counter each call). Passing the raw
+    # cfg.episode_length here gives 1000 physics / 8 repeat = 125 agent steps
+    # per episode. The previous code divided once here AND brax divided again
+    # internally, truncating episodes to 16 agent steps and breaking learning.
     return mp_wrapper.wrap_for_brax_training(
         raw_env,
-        episode_length=agent_episode_length,
+        episode_length=cfg.episode_length,
         action_repeat=cfg.action_repeat,
     )
 
@@ -837,12 +1022,27 @@ def main():
         next_observation=dummy_obs,
         extras={"state_extras": {"truncation": jnp.zeros(())}},
     )
-    replay_buffer = UniformFlatReplayBuffer(
-        max_replay_size=cfg.max_replay_size,
-        dummy_data_sample=dummy_transition,
-        sample_batch_size=cfg.batch_size,
-        storage_dtype=replay_pixel_dtype,
-    )
+    if cfg.replay_backend == "device":
+        if replay_pixel_dtype == "uint8_centered":
+            raise ValueError("uint8_centered replay is supported only with --replay-backend host")
+        replay_buffer = UniformFlatReplayBuffer(
+            max_replay_size=cfg.max_replay_size,
+            dummy_data_sample=dummy_transition,
+            sample_batch_size=cfg.batch_size,
+            storage_dtype=replay_pixel_dtype,
+        )
+    elif cfg.replay_backend == "host":
+        replay_cls = HostTypedReplayBuffer if replay_pixel_dtype == "uint8_centered" else HostFlatReplayBuffer
+        replay_buffer = replay_cls(
+            max_replay_size=cfg.max_replay_size,
+            dummy_data_sample=dummy_transition,
+            sample_batch_size=cfg.batch_size,
+            storage_dtype=replay_pixel_dtype,
+            seed=cfg.seed + 17,
+        )
+        print(f"  host replay bytes: {replay_buffer.nbytes / (1024 ** 3):.2f} GiB")
+    else:
+        raise ValueError(f"Unsupported replay_backend={cfg.replay_backend!r}")
 
     # Initialize training state
     rng, key_policy, key_q, key_buf = jax.random.split(rng, 4)
@@ -869,7 +1069,7 @@ def main():
     env_keys = jax.random.split(key_env, cfg.num_envs)
     env_state = jax.jit(train_env.reset)(env_keys)
     obs_state = _repeat_stack_pixels_sac(env_state.obs, cfg.frame_stack)
-    buffer_state = replay_buffer.init(key_buf)
+    buffer_state = replay_buffer.init(key_buf) if cfg.replay_backend == "device" else None
 
     # ------------------------------------------------------------------ #
     # Inner step fn: collect 1 env step + (optionally) 1 gradient update #
@@ -917,9 +1117,9 @@ def main():
             new_policy_params = _copy_rad_conv_weights_to_policy(
                 new_policy_params, new_q_params)
 
-        updated_target_q = jax.tree_util.tree_map(
-            lambda x, y: x * (1 - cfg.tau) + y * cfg.tau,
-            ts.target_q_params, new_q_params)
+        target_encoder_tau = cfg.encoder_tau if cfg.encoder_tau > 0 else cfg.tau
+        updated_target_q = _soft_update_q_params(
+            ts.target_q_params, new_q_params, cfg.tau, target_encoder_tau)
         do_target_update = (update_step % cfg.target_update_frequency) == 0
         new_target_q = jax.lax.cond(
             do_target_update,
@@ -1020,6 +1220,73 @@ def main():
         buf_st = replay_buffer.insert(buf_st, transition)
         return new_env_st, next_obs_st, buf_st, key
 
+    @jax.jit
+    def host_prefill_step(env_st, obs_st, key):
+        key, act_key = jax.random.split(key)
+        action = jax.random.uniform(
+            act_key, (cfg.num_envs, action_size), minval=-1.0, maxval=1.0)
+        new_env_st = train_env.step(env_st, action)
+        next_obs_st = _append_stack_pixels_sac(
+            obs_st, new_env_st.obs, new_env_st.done, cfg.frame_stack)
+        transition = types.Transition(
+            observation=obs_st,
+            action=action,
+            reward=new_env_st.reward,
+            discount=1.0 - new_env_st.done,
+            next_observation=next_obs_st,
+            extras={"state_extras": {"truncation": new_env_st.info.get(
+                "truncation", jnp.zeros(cfg.num_envs))}},
+        )
+        return new_env_st, next_obs_st, key, transition
+
+    @jax.jit
+    def host_collect_step(ts, env_st, obs_st, key):
+        key, act_key = jax.random.split(key)
+        policy_obs = _center_crop_pixels_sac(obs_st, cfg.crop_size)
+        dist_params = sac_net.policy_network.apply(
+            ts.normalizer_params, ts.policy_params, policy_obs)
+        action = sac_net.parametric_action_distribution.sample(dist_params, act_key)
+        new_env_st = train_env.step(env_st, action)
+        next_obs_st = _append_stack_pixels_sac(
+            obs_st, new_env_st.obs, new_env_st.done, cfg.frame_stack)
+        transition = types.Transition(
+            observation=obs_st,
+            action=action,
+            reward=new_env_st.reward,
+            discount=1.0 - new_env_st.done,
+            next_observation=next_obs_st,
+            extras={"state_extras": {"truncation": new_env_st.info.get(
+                "truncation", jnp.zeros(cfg.num_envs))}},
+        )
+        ts = ts.replace(env_steps=ts.env_steps + cfg.num_envs)
+        return ts, new_env_st, next_obs_st, key, transition
+
+    @functools.partial(jax.jit, donate_argnums=(0,))
+    def host_update_many(ts, sampled_batches, key):
+        def update_once(carry, sampled):
+            ts, key = carry
+            key, key_aug_obs, key_aug_nobs, upd_key = jax.random.split(key, 4)
+            if cfg.crop_size > 0:
+                sampled = sampled._replace(
+                    observation=_random_crop_pixels_sac(
+                        sampled.observation, key_aug_obs, cfg.crop_size),
+                    next_observation=_random_crop_pixels_sac(
+                        sampled.next_observation, key_aug_nobs, cfg.crop_size),
+                )
+            elif cfg.augment_pixels:
+                sampled = sampled._replace(
+                    observation=_random_translate_pixels_sac(
+                        sampled.observation, key_aug_obs),
+                    next_observation=_random_translate_pixels_sac(
+                        sampled.next_observation, key_aug_nobs),
+                )
+            ts, metrics = sgd_step(ts, sampled, upd_key)
+            return (ts, key), metrics
+
+        (ts, key), metrics = jax.lax.scan(
+            update_once, (ts, key), sampled_batches)
+        return ts, key, metrics
+
     # ---------------------------------------------------------------- #
     # Warmup: fill replay buffer with random actions                    #
     # ---------------------------------------------------------------- #
@@ -1027,8 +1294,13 @@ def main():
     warmup_steps = max(cfg.min_replay_size // cfg.num_envs, 1)
     for _ in range(warmup_steps):
         rng, step_key = jax.random.split(rng)
-        env_state, obs_state, buffer_state, rng = prefill_step(
-            env_state, obs_state, buffer_state, rng)
+        if cfg.replay_backend == "device":
+            env_state, obs_state, buffer_state, rng = prefill_step(
+                env_state, obs_state, buffer_state, rng)
+        else:
+            env_state, obs_state, rng, transition = host_prefill_step(
+                env_state, obs_state, rng)
+            replay_buffer.insert(transition)
 
     print(f"  Replay buffer ready. Starting training…")
 
@@ -1076,14 +1348,36 @@ def main():
         if steps_to_run <= 0:
             break
         rng, epoch_key = jax.random.split(rng)
-        training_state, env_state, obs_state, buffer_state, rng, epoch_metrics = training_epoch(
-            training_state, env_state, obs_state, buffer_state, epoch_key, steps_to_run)
+        if cfg.replay_backend == "device":
+            training_state, env_state, obs_state, buffer_state, rng, epoch_metrics = training_epoch(
+                training_state, env_state, obs_state, buffer_state, epoch_key, steps_to_run)
 
-        env_steps = int(training_state.env_steps)
-        avg_critic = float(jnp.mean(epoch_metrics["critic_loss"]))
-        avg_actor = float(jnp.mean(epoch_metrics["actor_loss"]))
-        alpha = float(jnp.exp(training_state.log_alpha))
-        del epoch_metrics
+            env_steps = int(training_state.env_steps)
+            avg_critic = float(jnp.mean(epoch_metrics["critic_loss"]))
+            avg_actor = float(jnp.mean(epoch_metrics["actor_loss"]))
+            alpha = float(jnp.exp(training_state.log_alpha))
+            del epoch_metrics
+        else:
+            critic_total = 0.0
+            actor_total = 0.0
+            metric_count = 0
+            for _ in range(steps_to_run):
+                epoch_key, collect_key, update_key = jax.random.split(epoch_key, 3)
+                training_state, env_state, obs_state, _, transition = host_collect_step(
+                    training_state, env_state, obs_state, collect_key)
+                replay_buffer.insert(transition)
+                sampled_batches = replay_buffer.sample_many(cfg.grad_updates_per_step)
+                training_state, epoch_key, update_metrics = host_update_many(
+                    training_state, sampled_batches, update_key)
+                critic_total += float(jnp.mean(update_metrics["critic_loss"]))
+                actor_total += float(jnp.mean(update_metrics["actor_loss"]))
+                metric_count += 1
+                del sampled_batches, update_metrics, transition
+            rng = epoch_key
+            env_steps = int(training_state.env_steps)
+            avg_critic = critic_total / max(metric_count, 1)
+            avg_actor = actor_total / max(metric_count, 1)
+            alpha = float(jnp.exp(training_state.log_alpha))
 
         # Eval
         rng, eval_key = jax.random.split(rng)

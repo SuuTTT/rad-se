@@ -92,6 +92,10 @@ class Config:
     reward_scaling: float = 0.1
     normalize_observations: bool = False  # pixel obs: don't normalize
     gae_lambda: float = 0.95
+    # Reward convention. Playground vision-mode cartpole uses _dense_vision_reward
+    # (additive penalty, episode range ~[-3900, 100]). dmc_reward=True forces the
+    # dm_control tolerance-product reward (per-step [0,1], episode [0,1000]).
+    dmc_reward: bool = False
     # CNN backbone (RAD-style DQN encoder)
     cnn_output_channels: tuple = (32, 64, 64)
     cnn_kernel_size: tuple = (8, 4, 3)
@@ -201,13 +205,23 @@ def make_envs(cfg: Config, num_envs: int, is_eval: bool = False):
     if "Swingup" in cfg.env or "swingup" in cfg.env:
         raw_env._fix_swingup_done = True
 
-    # Agent steps per episode = physics_steps / action_repeat
-    agent_episode_length = cfg.episode_length // cfg.action_repeat
+    # Force dm_control-style tolerance reward in vision mode (per-step [0,1],
+    # episode [0, 1000]) instead of the additive-penalty vision reward.
+    # Use a throwaway metrics dict so we don't add new keys into state.metrics,
+    # which would break the action-repeat scan pytree carry.
+    if cfg.dmc_reward and hasattr(raw_env, "_dense_reward"):
+        _dense = raw_env._dense_reward
+        def _dmc_reward_fn(data, action, info, metrics):
+            return _dense(data, action, info, {})
+        raw_env._get_reward = _dmc_reward_fn
 
-    # wrap_for_brax_training adds VmapWrapper, EpisodeWrapper, AutoResetWrapper
+    # NOTE: brax EpisodeWrapper measures episode_length in *physics* steps
+    # (it increments by `action_repeat` each call to step). So we pass the
+    # raw physics-step length here, NOT cfg.episode_length // action_repeat
+    # (that double-divide bug truncated episodes to 16 agent steps).
     wrapped = mp_wrapper.wrap_for_brax_training(
         raw_env,
-        episode_length=agent_episode_length,
+        episode_length=cfg.episode_length,
         action_repeat=cfg.action_repeat,
     )
     return wrapped
@@ -278,8 +292,6 @@ def main():
     print(f"[rad_brax_ppo] pixel obs shape: {obs_shape}")
     print(f"[rad_brax_ppo] action_size: {train_env.action_size}")
 
-    agent_episode_length = cfg.episode_length // cfg.action_repeat
-
     # Vision PPO network factory — RAD-style DQN encoder
     network_factory = functools.partial(
         ppo_networks_vision.make_ppo_networks_vision,
@@ -336,7 +348,7 @@ def main():
         normalize_observations=cfg.normalize_observations,
         gae_lambda=cfg.gae_lambda,
         num_evals=cfg.num_evals,
-        episode_length=agent_episode_length,
+        episode_length=cfg.episode_length,
         num_eval_envs=cfg.num_eval_envs,
         eval_env=eval_env,
         network_factory=network_factory,

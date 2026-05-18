@@ -6,7 +6,7 @@ brax.training.agents.sac.train does not support dict/pixel observations
 functions and replay buffer, but implements the training loop itself so that:
   - Pixel observations (dict with 'pixels/*' keys) are supported.
   - RAD random-translate augmentation is applied at sample time.
-  - Replay buffer stays on-device (UniformSamplingQueue) — no H2D transfer.
+    - Replay buffer stays on-device — no H2D transfer.
   - Training epoch is a single jax.jit call with inner jax.lax.scan.
 
 Memory constraints on RTX 3060 12 GB:
@@ -38,6 +38,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen
+from flax import struct as flax_struct
+from jax import flatten_util
 
 # Compatibility shim: brax 0.14.2 calls deprecated jax.device_put_replicated
 # (removed in JAX 0.10+). Restore it before importing brax.
@@ -55,7 +57,6 @@ if not hasattr(jax, "device_put_replicated"):
 
 from brax.training import distribution, gradients, networks as brax_networks, types
 from brax.training.agents.sac import losses as sac_losses, networks as sac_networks
-from brax.training import replay_buffers
 import warp as wp
 
 
@@ -79,6 +80,7 @@ class Config:
     min_replay_size: int = 1_000        # warmup steps before updates start
     batch_size: int = 256               # SAC minibatch from replay
     grad_updates_per_step: int = 1
+    replay_pixel_dtype: str = "float32"  # float32, float16, or bfloat16
     # SAC hypers
     total_timesteps: int = 500_000
     num_evals: int = 20
@@ -89,6 +91,12 @@ class Config:
     target_entropy: float = -0.5       # brax default for action_size=1; RAD uses -1.0
     reward_scaling: float = 0.1
     tau: float = 0.005                  # target network EMA coefficient
+    actor_update_frequency: int = 1
+    alpha_update_frequency: int = 1
+    target_update_frequency: int = 1
+    tie_actor_critic_encoder: bool = False
+    encoder_arch: str = "dqn"           # dqn or rad
+    rad_feature_dim: int = 50
     # CNN backbone (RAD-style DQN encoder, same as PPO)
     cnn_output_channels: tuple = (32, 64, 64)
     cnn_kernel_size: tuple = (8, 4, 3)
@@ -102,6 +110,7 @@ class Config:
     critic_hidden: tuple = (1024, 1024)
     # Augmentation
     augment_pixels: bool = True         # RAD random-translate at sample time
+    crop_size: int = 0                  # if >0, random crop train obs and center crop policy/eval obs
     # logging
     work_dir: str = "runs/brax_sac"
     track: bool = False
@@ -201,6 +210,69 @@ def _random_translate_pixels_sac(
     return rt_one(obs, keys)
 
 
+def _random_crop_pixels_sac(
+    obs: Mapping[str, jax.Array],
+    key: jax.Array,
+    crop_size: int,
+) -> Mapping[str, jax.Array]:
+    """Apply random spatial crops to [B, H, W, C] pixel observations."""
+    @jax.vmap
+    def crop_one(ub_obs: Mapping[str, jax.Array], rng: jax.Array):
+        def crop_view(img: jax.Array, rng: jax.Array) -> jax.Array:
+            h, w, c = img.shape
+            h_off = jax.random.randint(rng, (), 0, h - crop_size + 1)
+            _, rng = jax.random.split(rng)
+            w_off = jax.random.randint(rng, (), 0, w - crop_size + 1)
+            start = jnp.array([h_off, w_off, 0], dtype=jnp.int32)
+            return jax.lax.dynamic_slice(img, start, (crop_size, crop_size, c))
+
+        out = {}
+        for k, v in ub_obs.items():
+            if k.startswith("pixels/"):
+                rng, subkey = jax.random.split(rng)
+                out[k] = crop_view(v, subkey)
+        return {**ub_obs, **out}
+
+    bdim = next(iter(obs.values())).shape[0]
+    keys = jax.random.split(key, bdim)
+    return crop_one(obs, keys)
+
+
+def _center_crop_pixels_sac(
+    obs: Mapping[str, jax.Array],
+    crop_size: int,
+) -> Mapping[str, jax.Array]:
+    """Apply deterministic center crops to [B, H, W, C] pixel observations."""
+    if crop_size <= 0:
+        return obs
+    out = dict(obs)
+    for k, v in obs.items():
+        if k.startswith("pixels/"):
+            h, w, c = v.shape[-3:]
+            if crop_size >= h and crop_size >= w:
+                continue
+            h_off = (h - crop_size) // 2
+            w_off = (w - crop_size) // 2
+            start = (0,) * (v.ndim - 3) + (h_off, w_off, 0)
+            size = v.shape[:-3] + (crop_size, crop_size, c)
+            out[k] = jax.lax.dynamic_slice(v, start, size)
+    return out
+
+
+def _pixel_storage_dtype(name: str):
+    if name == "float32":
+        return jnp.float32
+    if name == "float16":
+        return jnp.float16
+    if name == "bfloat16":
+        return jnp.bfloat16
+    raise ValueError(f"Unsupported replay_pixel_dtype={name!r}")
+
+
+def _cast_transition(transition: types.Transition, dtype) -> types.Transition:
+    return jax.tree_util.tree_map(lambda x: x.astype(dtype), transition)
+
+
 def _repeat_stack_pixels_sac(
     obs: Mapping[str, jax.Array],
     frame_stack: int,
@@ -239,10 +311,85 @@ def _append_stack_pixels_sac(
 # Vision SAC networks: policy via brax, Q-network custom (CNN + action + MLP)
 # ---------------------------------------------------------------------------
 
+class PixelEncoderRAD(linen.Module):
+    feature_dim: int = 50
+    activation: Any = linen.relu
+
+    @linen.compact
+    def __call__(self, pixels: jax.Array):
+        x = pixels
+        for idx, stride in enumerate((2, 1, 1, 1)):
+            x = linen.Conv(
+                features=32,
+                kernel_size=(3, 3),
+                strides=(stride, stride),
+                padding="VALID",
+                name=f"conv{idx + 1}",
+            )(x)
+            x = self.activation(x)
+        x = x.reshape((x.shape[0], -1))
+        x = linen.Dense(self.feature_dim, name="fc")(x)
+        x = linen.LayerNorm(name="ln")(x)
+        return jnp.tanh(x)
+
+
+class VisionPolicyModule(linen.Module):
+    output_size: int
+    hidden_layer_sizes: Sequence[int] = (1024, 1024)
+    encoder_arch: str = "dqn"
+    rad_feature_dim: int = 50
+    cnn_output_channels: Sequence[int] = (32, 64, 64)
+    cnn_kernel_size: Sequence[int] = (8, 4, 3)
+    cnn_stride: Sequence[int] = (4, 2, 1)
+    cnn_padding: str = "VALID"
+    cnn_activation: linen.activation.PReLU = linen.relu
+    cnn_max_pool: bool = False
+    cnn_global_pool: str = "avg"
+    activation: Any = linen.relu
+
+    @linen.compact
+    def __call__(self, obs: Mapping[str, jax.Array]):
+        pixels = {k: v for k, v in obs.items() if k.startswith("pixels/")}
+        embeddings = []
+        kernel_sizes = tuple((k, k) for k in self.cnn_kernel_size)
+        strides = tuple((s, s) for s in self.cnn_stride)
+        for pkey in sorted(pixels.keys()):
+            if self.encoder_arch == "rad":
+                embed = PixelEncoderRAD(
+                    feature_dim=self.rad_feature_dim,
+                    activation=self.activation,
+                    name=f"rad_encoder_{pkey.replace('/', '_')}",
+                )(pixels[pkey])
+            else:
+                embed = brax_networks.CNN(
+                    num_filters=self.cnn_output_channels,
+                    kernel_sizes=kernel_sizes,
+                    strides=strides,
+                    activation=self.cnn_activation,
+                    padding=self.cnn_padding,
+                    max_pool=self.cnn_max_pool,
+                )(pixels[pkey])
+                if self.cnn_global_pool == "avg":
+                    embed = jnp.mean(embed, axis=(-3, -2))
+                elif self.cnn_global_pool == "max":
+                    embed = jnp.max(embed, axis=(-3, -2))
+                else:
+                    embed = embed.reshape(embed.shape[0], -1)
+            embeddings.append(embed)
+
+        policy_input = jnp.concatenate(embeddings, axis=-1)
+        return brax_networks.MLP(
+            layer_sizes=list(self.hidden_layer_sizes) + [self.output_size],
+            activation=self.activation,
+        )(policy_input)
+
+
 class VisionQModule(linen.Module):
     """Twin-Q critic for pixel obs. Each critic has its own CNN encoder."""
     n_critics: int = 2
     hidden_layer_sizes: Sequence[int] = (1024, 1024)
+    encoder_arch: str = "dqn"
+    rad_feature_dim: int = 50
     cnn_output_channels: Sequence[int] = (32, 64, 64)
     cnn_kernel_size: Sequence[int] = (8, 4, 3)
     cnn_stride: Sequence[int] = (4, 2, 1)
@@ -263,20 +410,26 @@ class VisionQModule(linen.Module):
             # Independent CNN encoder per critic
             cnn_outs = []
             for pkey in sorted(pixels.keys()):
-                cnn_out = brax_networks.CNN(
-                    num_filters=self.cnn_output_channels,
-                    kernel_sizes=kernel_sizes,
-                    strides=strides,
-                    activation=self.cnn_activation,
-                    padding=self.cnn_padding,
-                    max_pool=self.cnn_max_pool,
-                )(pixels[pkey])
-                if self.cnn_global_pool == "avg":
-                    cnn_out = jnp.mean(cnn_out, axis=(-3, -2))
-                elif self.cnn_global_pool == "max":
-                    cnn_out = jnp.max(cnn_out, axis=(-3, -2))
-                else:  # flatten
-                    cnn_out = cnn_out.reshape(cnn_out.shape[0], -1)
+                if self.encoder_arch == "rad":
+                    cnn_out = PixelEncoderRAD(
+                        feature_dim=self.rad_feature_dim,
+                        activation=self.activation,
+                    )(pixels[pkey])
+                else:
+                    cnn_out = brax_networks.CNN(
+                        num_filters=self.cnn_output_channels,
+                        kernel_sizes=kernel_sizes,
+                        strides=strides,
+                        activation=self.cnn_activation,
+                        padding=self.cnn_padding,
+                        max_pool=self.cnn_max_pool,
+                    )(pixels[pkey])
+                    if self.cnn_global_pool == "avg":
+                        cnn_out = jnp.mean(cnn_out, axis=(-3, -2))
+                    elif self.cnn_global_pool == "max":
+                        cnn_out = jnp.max(cnn_out, axis=(-3, -2))
+                    else:  # flatten
+                        cnn_out = cnn_out.reshape(cnn_out.shape[0], -1)
                 cnn_outs.append(cnn_out)
 
             embed = jnp.concatenate(cnn_outs + [actions], axis=-1)
@@ -289,6 +442,28 @@ class VisionQModule(linen.Module):
         return jnp.concatenate(q_vals, axis=-1)  # [B, n_critics]
 
 
+def _copy_rad_conv_weights_to_policy(policy_params: Any, q_params: Any) -> Any:
+    """Copies first critic RAD conv weights into actor RAD encoders."""
+    def clone_leaf(x):
+        return x + jnp.zeros_like(x)
+
+    policy_params = dict(policy_params)
+    policy_vars = dict(policy_params["params"])
+    source_encoder = q_params["params"]["PixelEncoderRAD_0"]
+
+    for encoder_name, encoder_params in policy_vars.items():
+        if not encoder_name.startswith("rad_encoder_"):
+            continue
+        tied_encoder = dict(encoder_params)
+        for conv_name in ("conv1", "conv2", "conv3", "conv4"):
+            tied_encoder[conv_name] = jax.tree_util.tree_map(
+                clone_leaf, source_encoder[conv_name])
+        policy_vars[encoder_name] = tied_encoder
+
+    policy_params["params"] = policy_vars
+    return policy_params
+
+
 def make_sac_networks_vision(
     obs_size: Mapping[str, Tuple],   # per-env, e.g. {'pixels/view_0': (H,W,C)}
     action_size: int,
@@ -297,26 +472,11 @@ def make_sac_networks_vision(
     """Create policy + Q-network for pixel SAC."""
     act = linen.relu if cfg.cnn_activation == "relu" else linen.swish
 
-    # Policy network: reuse brax's make_policy_network_vision
-    policy_net = brax_networks.make_policy_network_vision(
-        observation_size=obs_size,
+    policy_module = VisionPolicyModule(
         output_size=distribution.NormalTanhDistribution(action_size).param_size,
         hidden_layer_sizes=cfg.policy_hidden,
-        activation=act,
-        cnn_output_channels=cfg.cnn_output_channels,
-        cnn_kernel_size=cfg.cnn_kernel_size,
-        cnn_stride=cfg.cnn_stride,
-        cnn_padding=cfg.cnn_padding,
-        cnn_activation=act,
-        cnn_max_pool=cfg.cnn_max_pool,
-        cnn_global_pool=cfg.cnn_global_pool,
-        distribution_type="tanh_normal",
-    )
-
-    # Q-network: custom twin-Q with independent CNN encoders
-    q_module = VisionQModule(
-        n_critics=2,
-        hidden_layer_sizes=cfg.critic_hidden,
+        encoder_arch=cfg.encoder_arch,
+        rad_feature_dim=cfg.rad_feature_dim,
         cnn_output_channels=cfg.cnn_output_channels,
         cnn_kernel_size=cfg.cnn_kernel_size,
         cnn_stride=cfg.cnn_stride,
@@ -327,6 +487,30 @@ def make_sac_networks_vision(
         activation=act,
     )
     dummy_obs = {k: jnp.zeros((1,) + v) for k, v in obs_size.items()}
+
+    def policy_apply(processor_params, policy_params, obs):
+        return policy_module.apply(policy_params, obs)
+
+    policy_net = brax_networks.FeedForwardNetwork(
+        init=lambda key: policy_module.init(key, dummy_obs),
+        apply=policy_apply,
+    )
+
+    # Q-network: custom twin-Q with independent CNN encoders
+    q_module = VisionQModule(
+        n_critics=2,
+        hidden_layer_sizes=cfg.critic_hidden,
+        encoder_arch=cfg.encoder_arch,
+        rad_feature_dim=cfg.rad_feature_dim,
+        cnn_output_channels=cfg.cnn_output_channels,
+        cnn_kernel_size=cfg.cnn_kernel_size,
+        cnn_stride=cfg.cnn_stride,
+        cnn_padding=cfg.cnn_padding,
+        cnn_activation=act,
+        cnn_max_pool=cfg.cnn_max_pool,
+        cnn_global_pool=cfg.cnn_global_pool,
+        activation=act,
+    )
     dummy_act = jnp.zeros((1, action_size))
 
     def q_apply(processor_params, q_params, obs, actions):
@@ -403,10 +587,71 @@ def make_sac_losses_vision(
 
 
 # ---------------------------------------------------------------------------
-# Training state
+# Typed replay buffer
 # ---------------------------------------------------------------------------
 
-from flax import struct as flax_struct
+@flax_struct.dataclass
+class FlatReplayBufferState:
+    data: jax.Array
+    insert_position: jax.Array
+    sample_position: jax.Array
+    key: jax.Array
+
+
+class UniformFlatReplayBuffer:
+    """Uniform replay with one reduced-precision flat storage array."""
+
+    def __init__(self, max_replay_size: int, dummy_data_sample: Any, sample_batch_size: int, storage_dtype):
+        self._storage_dtype = storage_dtype
+        dummy_storage = _cast_transition(dummy_data_sample, storage_dtype)
+        dummy_flatten, self._unflatten_fn = flatten_util.ravel_pytree(dummy_storage)
+        self._unflatten_fn = jax.vmap(self._unflatten_fn)
+        self._flatten_fn = jax.vmap(
+            lambda x: flatten_util.ravel_pytree(_cast_transition(x, storage_dtype))[0])
+        self._data_shape = (max_replay_size, len(dummy_flatten))
+        self._sample_batch_size = sample_batch_size
+
+    def init(self, key: jax.Array) -> FlatReplayBufferState:
+        return FlatReplayBufferState(
+            data=jnp.zeros(self._data_shape, self._storage_dtype),
+            insert_position=jnp.zeros((), jnp.int32),
+            sample_position=jnp.zeros((), jnp.int32),
+            key=key,
+        )
+
+    def insert(self, buffer_state: FlatReplayBufferState, samples: Any) -> FlatReplayBufferState:
+        update = self._flatten_fn(samples)
+        data = buffer_state.data
+        position = buffer_state.insert_position
+        roll = jnp.minimum(0, len(data) - position - len(update))
+        data = jax.lax.cond(
+            roll, lambda: jnp.roll(data, roll, axis=0), lambda: data)
+        position = position + roll
+        data = jax.lax.dynamic_update_slice_in_dim(data, update, position, axis=0)
+        position = (position + len(update)) % (len(data) + 1)
+        sample_position = jnp.maximum(0, buffer_state.sample_position + roll)
+        return buffer_state.replace(
+            data=data,
+            insert_position=position,
+            sample_position=sample_position,
+        )
+
+    def sample(self, buffer_state: FlatReplayBufferState) -> tuple[FlatReplayBufferState, Any]:
+        key, sample_key = jax.random.split(buffer_state.key)
+        idx = jax.random.randint(
+            sample_key,
+            (self._sample_batch_size,),
+            minval=buffer_state.sample_position,
+            maxval=buffer_state.insert_position,
+        )
+        flat_batch = jnp.take(buffer_state.data, idx, axis=0, mode="wrap")
+        batch = _cast_transition(self._unflatten_fn(flat_batch), jnp.float32)
+        return buffer_state.replace(key=key), batch
+
+
+# ---------------------------------------------------------------------------
+# Training state
+# ---------------------------------------------------------------------------
 
 @flax_struct.dataclass
 class SACTrainingState:
@@ -419,6 +664,7 @@ class SACTrainingState:
     alpha_optimizer_state: Any
     normalizer_params: Any          # dummy (pixels not normalized)
     env_steps: jax.Array
+    gradient_steps: jax.Array
 
 
 # ---------------------------------------------------------------------------
@@ -538,12 +784,18 @@ def main():
     # Obs / action sizes
     full_obs_size = train_env.observation_size   # includes batch dim: {k: (N,H,W,C)}
     raw_obs_size = {k: v[1:] for k, v in full_obs_size.items()}  # {k: (H,W,C)}
-    obs_size = {}
+    replay_obs_size = {}
     for k, v in raw_obs_size.items():
         if k.startswith("pixels/") and cfg.frame_stack > 1:
-            obs_size[k] = v[:-1] + (v[-1] * cfg.frame_stack,)
+            replay_obs_size[k] = v[:-1] + (v[-1] * cfg.frame_stack,)
         else:
-            obs_size[k] = v
+            replay_obs_size[k] = v
+    obs_size = dict(replay_obs_size)
+    if cfg.crop_size > 0:
+        obs_size = {
+            k: ((cfg.crop_size, cfg.crop_size) + v[-1:] if k.startswith("pixels/") else v)
+            for k, v in obs_size.items()
+        }
     action_size = train_env.action_size
 
     print(f"  obs_size (per env): {obs_size}")
@@ -571,8 +823,11 @@ def main():
     actor_update = gradients.gradient_update_fn(
         actor_loss_fn, policy_optimizer, pmap_axis_name=None)
 
-    # Replay buffer: flat storage, per-env unbatched dummy
-    dummy_obs = {k: jnp.zeros(v) for k, v in obs_size.items()}
+    replay_pixel_dtype = _pixel_storage_dtype(cfg.replay_pixel_dtype)
+
+    # Replay buffer: flat storage in the requested reduced precision. Samples
+    # are cast back to float32 before augmentation/network use.
+    dummy_obs = {k: jnp.zeros(v, dtype=jnp.float32) for k, v in replay_obs_size.items()}
     dummy_action = jnp.zeros(action_size)
     dummy_transition = types.Transition(
         observation=dummy_obs,
@@ -582,16 +837,19 @@ def main():
         next_observation=dummy_obs,
         extras={"state_extras": {"truncation": jnp.zeros(())}},
     )
-    replay_buffer = replay_buffers.UniformSamplingQueue(
+    replay_buffer = UniformFlatReplayBuffer(
         max_replay_size=cfg.max_replay_size,
         dummy_data_sample=dummy_transition,
         sample_batch_size=cfg.batch_size,
+        storage_dtype=replay_pixel_dtype,
     )
 
     # Initialize training state
     rng, key_policy, key_q, key_buf = jax.random.split(rng, 4)
     policy_params = sac_net.policy_network.init(key_policy)
     q_params = sac_net.q_network.init(key_q)
+    if cfg.tie_actor_critic_encoder:
+        policy_params = _copy_rad_conv_weights_to_policy(policy_params, q_params)
     training_state = SACTrainingState(
         policy_params=policy_params,
         policy_optimizer_state=policy_optimizer.init(policy_params),
@@ -603,6 +861,7 @@ def main():
             jnp.array(np.log(cfg.init_temperature), dtype=jnp.float32)),
         normalizer_params=jnp.zeros(()),     # dummy: pixels not normalized
         env_steps=jnp.zeros((), dtype=jnp.int32),
+        gradient_steps=jnp.zeros((), dtype=jnp.int32),
     )
 
     # Initialize env state and replay buffer
@@ -619,20 +878,55 @@ def main():
     def sgd_step(ts: SACTrainingState, transitions: types.Transition, key: jax.Array):
         key, key_alpha, key_critic, key_actor = jax.random.split(key, 4)
         alpha = jnp.exp(ts.log_alpha)
+        update_step = ts.gradient_steps
 
-        alpha_loss, new_log_alpha, new_alpha_opt = alpha_update(
-            ts.log_alpha, ts.policy_params, ts.normalizer_params,
-            transitions, key_alpha, optimizer_state=ts.alpha_optimizer_state)
+        def update_alpha(_):
+            return alpha_update(
+                ts.log_alpha, ts.policy_params, ts.normalizer_params,
+                transitions, key_alpha, optimizer_state=ts.alpha_optimizer_state)
+
+        def skip_alpha(_):
+            loss = alpha_loss_fn(
+                ts.log_alpha, ts.policy_params, ts.normalizer_params,
+                transitions, key_alpha)
+            return loss, ts.log_alpha, ts.alpha_optimizer_state
+
+        do_alpha_update = (update_step % cfg.alpha_update_frequency) == 0
+        alpha_loss, new_log_alpha, new_alpha_opt = jax.lax.cond(
+            do_alpha_update, update_alpha, skip_alpha, operand=None)
         critic_loss, new_q_params, new_q_opt = critic_update(
             ts.q_params, ts.policy_params, ts.normalizer_params,
             ts.target_q_params, alpha, transitions, key_critic,
             optimizer_state=ts.q_optimizer_state)
-        actor_loss, new_policy_params, new_policy_opt = actor_update(
-            ts.policy_params, ts.normalizer_params, ts.q_params, alpha,
-            transitions, key_actor, optimizer_state=ts.policy_optimizer_state)
-        new_target_q = jax.tree_util.tree_map(
+
+        def update_actor(_):
+            return actor_update(
+                ts.policy_params, ts.normalizer_params, new_q_params, alpha,
+                transitions, key_actor, optimizer_state=ts.policy_optimizer_state)
+
+        def skip_actor(_):
+            loss = actor_loss_fn(
+                ts.policy_params, ts.normalizer_params, new_q_params, alpha,
+                transitions, key_actor)
+            return loss, ts.policy_params, ts.policy_optimizer_state
+
+        do_actor_update = (update_step % cfg.actor_update_frequency) == 0
+        actor_loss, new_policy_params, new_policy_opt = jax.lax.cond(
+            do_actor_update, update_actor, skip_actor, operand=None)
+        if cfg.tie_actor_critic_encoder:
+            new_policy_params = _copy_rad_conv_weights_to_policy(
+                new_policy_params, new_q_params)
+
+        updated_target_q = jax.tree_util.tree_map(
             lambda x, y: x * (1 - cfg.tau) + y * cfg.tau,
             ts.target_q_params, new_q_params)
+        do_target_update = (update_step % cfg.target_update_frequency) == 0
+        new_target_q = jax.lax.cond(
+            do_target_update,
+            lambda _: updated_target_q,
+            lambda _: ts.target_q_params,
+            operand=None,
+        )
 
         return ts.replace(
             policy_params=new_policy_params,
@@ -642,6 +936,7 @@ def main():
             target_q_params=new_target_q,
             log_alpha=new_log_alpha,
             alpha_optimizer_state=new_alpha_opt,
+            gradient_steps=ts.gradient_steps + 1,
         ), {"alpha_loss": alpha_loss, "critic_loss": critic_loss, "actor_loss": actor_loss}
 
     @functools.partial(jax.jit, donate_argnums=(0, 1, 2, 3), static_argnums=(5,))
@@ -649,12 +944,13 @@ def main():
         """One epoch: `steps` env-steps + SAC updates."""
         def step_fn(carry, _):
             ts, env_st, obs_st, buf_st, key = carry
-            key, act_key, aug_key, upd_key = jax.random.split(key, 4)
+            key, act_key, upd_key = jax.random.split(key, 3)
 
             # Collect: infer action from current obs
             obs = obs_st
+            policy_obs = _center_crop_pixels_sac(obs_st, cfg.crop_size)
             dist_params = sac_net.policy_network.apply(
-                ts.normalizer_params, ts.policy_params, obs)
+                ts.normalizer_params, ts.policy_params, policy_obs)
             action = sac_net.parametric_action_distribution.sample(dist_params, act_key)
             new_env_st = train_env.step(env_st, action)
             next_obs_st = _append_stack_pixels_sac(
@@ -664,7 +960,7 @@ def main():
             transition = types.Transition(
                 observation=obs,
                 action=action,
-                reward=new_env_st.reward * cfg.reward_scaling,
+                reward=new_env_st.reward,
                 discount=1.0 - new_env_st.done,
                 next_observation=next_obs_st,
                 extras={"state_extras": {"truncation": new_env_st.info.get("truncation",
@@ -672,17 +968,30 @@ def main():
             )
             buf_st = replay_buffer.insert(buf_st, transition)
 
-            # Update: sample + augment + sgd
-            buf_st, sampled = replay_buffer.sample(buf_st)
-            if cfg.augment_pixels:
-                key, key_aug_obs, key_aug_nobs = jax.random.split(key, 3)
-                sampled = sampled._replace(
-                    observation=_random_translate_pixels_sac(
-                        sampled.observation, key_aug_obs),
-                    next_observation=_random_translate_pixels_sac(
-                        sampled.next_observation, key_aug_nobs),
-                )
-            ts, metrics = sgd_step(ts, sampled, upd_key)
+            def update_once(update_carry, _):
+                ts, buf_st, key = update_carry
+                key, key_aug_obs, key_aug_nobs, upd_key = jax.random.split(key, 4)
+                buf_st, sampled = replay_buffer.sample(buf_st)
+                if cfg.crop_size > 0:
+                    sampled = sampled._replace(
+                        observation=_random_crop_pixels_sac(
+                            sampled.observation, key_aug_obs, cfg.crop_size),
+                        next_observation=_random_crop_pixels_sac(
+                            sampled.next_observation, key_aug_nobs, cfg.crop_size),
+                    )
+                elif cfg.augment_pixels:
+                    sampled = sampled._replace(
+                        observation=_random_translate_pixels_sac(
+                            sampled.observation, key_aug_obs),
+                        next_observation=_random_translate_pixels_sac(
+                            sampled.next_observation, key_aug_nobs),
+                    )
+                ts, metrics = sgd_step(ts, sampled, upd_key)
+                return (ts, buf_st, key), metrics
+
+            (ts, buf_st, key), metrics = jax.lax.scan(
+                update_once, (ts, buf_st, upd_key), None,
+                length=cfg.grad_updates_per_step)
             ts = ts.replace(env_steps=ts.env_steps + cfg.num_envs)
             return (ts, new_env_st, next_obs_st, buf_st, key), metrics
 
@@ -702,7 +1011,7 @@ def main():
         transition = types.Transition(
             observation=obs_st,
             action=action,
-            reward=new_env_st.reward * cfg.reward_scaling,
+            reward=new_env_st.reward,
             discount=1.0 - new_env_st.done,
             next_observation=next_obs_st,
             extras={"state_extras": {"truncation": new_env_st.info.get(
@@ -747,7 +1056,8 @@ def main():
         def _eval_step(carry, _):
             st, obs_st, k = carry
             k, sk = jax.random.split(k)
-            a, _ = eval_policy_fn(obs_st, sk)
+            policy_obs = _center_crop_pixels_sac(obs_st, cfg.crop_size)
+            a, _ = eval_policy_fn(policy_obs, sk)
             st = eval_env.step(st, a)
             obs_st = _append_stack_pixels_sac(obs_st, st.obs, st.done, cfg.frame_stack)
             return (st, obs_st, k), st.reward
@@ -769,6 +1079,12 @@ def main():
         training_state, env_state, obs_state, buffer_state, rng, epoch_metrics = training_epoch(
             training_state, env_state, obs_state, buffer_state, epoch_key, steps_to_run)
 
+        env_steps = int(training_state.env_steps)
+        avg_critic = float(jnp.mean(epoch_metrics["critic_loss"]))
+        avg_actor = float(jnp.mean(epoch_metrics["actor_loss"]))
+        alpha = float(jnp.exp(training_state.log_alpha))
+        del epoch_metrics
+
         # Eval
         rng, eval_key = jax.random.split(rng)
         er = float(run_eval(
@@ -777,11 +1093,7 @@ def main():
             eval_key))
 
         elapsed = time.time() - t0
-        env_steps = int(training_state.env_steps)
         sps = int(env_steps / elapsed) if elapsed > 1 else 0
-        avg_critic = float(jnp.mean(epoch_metrics["critic_loss"]))
-        avg_actor = float(jnp.mean(epoch_metrics["actor_loss"]))
-        alpha = float(jnp.exp(training_state.log_alpha))
 
         print(f"| brax_sac | S:{env_steps:8d} | SPS:{sps:5d} | "
               f"ER:{er:8.2f} | critic:{avg_critic:.3f} | "
